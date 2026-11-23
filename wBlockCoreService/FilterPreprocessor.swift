@@ -68,9 +68,9 @@ public actor FilterPreprocessor {
         await preprocessWithChangeFlag(content: content, listURL: listURL).content
     }
 
-    func preprocessWithChangeFlag(content: String, listURL: URL) async -> (content: String, modified: Bool) {
+    func preprocessWithChangeFlag(content: String, listURL: URL) async -> (content: String, modified: Bool, hasIncludes: Bool) {
         if Self.canPassThroughUnchanged(content) {
-            return (content, false)
+            return (content, false, false)
         }
 
         // Step 1: Split into lines
@@ -93,7 +93,7 @@ public actor FilterPreprocessor {
 
         // Step 5: Expand all !#include directives recursively.
         // Depth starts at 0; IncludeResolver increments on each level of recursion.
-        let expanded = await resolver.expandIncludes(
+        let expanded = await resolver.expandIncludesTrackingDependencies(
             in: evaluated,
             baseURL: baseURL,
             visited: visited,
@@ -101,7 +101,11 @@ public actor FilterPreprocessor {
         )
 
         // Step 6: Join and return as a single string for SafariConverterLib.
-        return (expanded.joined(separator: "\n"), true)
+        return (expanded.lines.joined(separator: "\n"), true, expanded.hasIncludes)
+    }
+
+    static func mayContainIncludes(_ data: Data) -> Bool {
+        data.range(of: Data("!#include".utf8)) != nil || data.range(of: Data("%include ".utf8)) != nil
     }
 
     /// Returns true only when `content` has LF-only line breaks, stays within line/byte

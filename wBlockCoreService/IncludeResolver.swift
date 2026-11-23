@@ -50,6 +50,7 @@ public actor IncludeResolver {
     private struct ExpansionResult {
         let lines: [String]
         let bytes: Int
+        var hasIncludes = false
     }
 
     // MARK: - Initializer
@@ -104,14 +105,24 @@ public actor IncludeResolver {
         visited: Set<String>,
         depth: Int
     ) async -> [String] {
-        await expandIncludes(
+        await expandIncludesTrackingDependencies(in: lines, baseURL: baseURL, visited: visited, depth: depth).lines
+    }
+
+    func expandIncludesTrackingDependencies(
+        in lines: [String],
+        baseURL: URL,
+        visited: Set<String>,
+        depth: Int
+    ) async -> (lines: [String], hasIncludes: Bool) {
+        let result = await expandIncludes(
             in: lines,
             baseURL: baseURL,
             visited: visited,
             depth: depth,
             maximumLines: Self.maxExpandedLines,
             maximumBytes: Self.maxExpandedBytes
-        ).lines
+        )
+        return (result.lines, result.hasIncludes)
     }
 
     /// Resolves a single `!#include` line into the expanded lines from the referenced sub-list.
@@ -152,6 +163,7 @@ public actor IncludeResolver {
         var result: [String] = []
         result.reserveCapacity(min(lines.count, maximumLines))
         var resultBytes = 0
+        var hasIncludes = false
 
         for line in lines {
             guard result.count < maximumLines, resultBytes < maximumBytes else { break }
@@ -167,6 +179,7 @@ public actor IncludeResolver {
                 )
                 result.append(contentsOf: expanded.lines)
                 resultBytes += expanded.bytes
+                hasIncludes = hasIncludes || expanded.hasIncludes
             } else {
                 let lineBytes = line.utf8.count + 1
                 guard resultBytes + lineBytes <= maximumBytes else { break }
@@ -174,7 +187,7 @@ public actor IncludeResolver {
                 resultBytes += lineBytes
             }
         }
-        return ExpansionResult(lines: result, bytes: resultBytes)
+        return ExpansionResult(lines: result, bytes: resultBytes, hasIncludes: hasIncludes)
     }
 
     private func resolve(
@@ -225,7 +238,7 @@ public actor IncludeResolver {
             let evaluated = ConditionalEvaluator.evaluate(
                 lines: content.components(separatedBy: .newlines)
             )
-            return await expandIncludes(
+            var result = await expandIncludes(
                 in: evaluated,
                 baseURL: subURL.deletingLastPathComponent(),
                 visited: nextVisited,
@@ -233,6 +246,8 @@ public actor IncludeResolver {
                 maximumLines: maximumLines,
                 maximumBytes: maximumBytes
             )
+            result.hasIncludes = true
+            return result
         } catch {
             await onFetchError?(subURL, nil)
             return ExpansionResult(lines: [], bytes: 0)

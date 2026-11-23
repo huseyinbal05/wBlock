@@ -24,7 +24,7 @@ public enum FilterUpdateResponseClassifier {
         responseData: Data?,
         localData: @autoclosure () -> Data?,
         usedFallbackMirror: Bool = false,
-        localNormalizedDigest: String? = nil
+        localNormalizedDigest: @autoclosure () -> String? = nil
     ) -> FilterUpdateResponseStatus {
         switch statusCode {
         case 304:
@@ -35,7 +35,7 @@ public enum FilterUpdateResponseClassifier {
             }
             return contentDiffers(
                 remoteData: responseData, localData: localData(),
-                usedFallbackMirror: usedFallbackMirror, localNormalizedDigest: localNormalizedDigest)
+                usedFallbackMirror: usedFallbackMirror, localNormalizedDigest: localNormalizedDigest())
                 ? .updatedContent
                 : .unchangedContent
         default:
@@ -88,11 +88,8 @@ public enum FilterUpdateResponseClassifier {
     ) -> Bool {
         guard let localData else { return true }
         guard remoteData != localData else { return false }
-        let remoteText = String(decoding: remoteData, as: UTF8.self)
-        if usedFallbackMirror,
-           let remoteVersion = numericVersion(remoteText),
-           let localVersion = numericVersion(String(decoding: localData.prefix(16_384), as: UTF8.self)),
-           UserScript.isVersionNewer(localVersion, than: remoteVersion) {
+        guard let remoteText = String(data: remoteData, encoding: .utf8) else { return true }
+        if usedFallbackMirror, isOlderMirror(remoteText, than: localData) {
             return false
         }
         var normalizedText = FilterListContentProcessing.normalizedContent(from: remoteText)
@@ -112,6 +109,14 @@ public enum FilterUpdateResponseClassifier {
             return !equal
         }
         return !normalizedText.utf8.elementsEqual(localData)
+    }
+
+    static func isOlderMirror(_ remoteText: String, than localData: Data) -> Bool {
+        let prefix = localData.prefix(16_384)
+        let localText = String(data: prefix, encoding: .utf8) ?? String(decoding: prefix, as: UTF8.self)
+        guard let remoteVersion = numericVersion(remoteText),
+              let localVersion = numericVersion(localText) else { return false }
+        return UserScript.isVersionNewer(localVersion, than: remoteVersion)
     }
 
     /// Only dotted numbers order reliably; some lists stamp a date instead.

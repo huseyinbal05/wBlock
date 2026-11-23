@@ -277,8 +277,7 @@ public enum FilterListContentProcessing {
     }
 
     private static func hasNonLFNewline(in text: String) -> Bool {
-        var copy = text
-        let contiguous = copy.utf8.withContiguousStorageIfAvailable { bytes -> Bool in
+        let contiguous = text.utf8.withContiguousStorageIfAvailable { bytes -> Bool in
             var i = 0
             while i < bytes.count {
                 let b = bytes[i]
@@ -440,8 +439,14 @@ public enum FilterListContentProcessing {
         var hosts: [String] = []
         hosts.reserveCapacity(names.count)
         for name in names {
-            guard isHostsHostname(name.utf8) else { continue }
-            let lower = RuleText.lowercased(name)
+            let lower: String
+            if isHostsHostname(name.utf8) {
+                lower = RuleText.lowercased(name)
+            } else {
+                guard name.utf8.contains(where: { $0 >= 0x80 }) else { continue }
+                lower = name.lowercased()
+                guard isHostsHostname(lower.utf8) else { continue }
+            }
             if !loopbackHostnames.contains(lower) {
                 hosts.append(lower)
             }

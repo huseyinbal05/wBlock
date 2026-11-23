@@ -34,15 +34,16 @@ public enum FilterDownloadProcessor {
     }
 
     /// A list after normalization and include expansion, ready to stage.
-    private struct ExpandedSource {
-        var data: Data
-        var filter: FilterList
-        let strippedDirectives: [String]
-        /// The raw body for uBO-style delta updates. Nil for lists without `! Diff-Path:`.
-        let baselineData: Data?
+    public struct PreparedSource: Sendable {
+        fileprivate var data: Data
+        fileprivate var filter: FilterList
+        fileprivate let strippedDirectives: [String]
+        /// The raw body for delta updates or rechecking included files.
+        fileprivate let baselineData: Data?
         /// Digest of the normalized unexpanded body when preprocessing modified the text;
         /// nil when the saved `data` is already identical (`sourceSHA256` applies directly).
-        let normalizedDigest: String?
+        fileprivate let normalizedDigest: String?
+        fileprivate let includeSource: URL?
     }
 
     public static func processAndPublish(
@@ -55,12 +56,61 @@ public enum FilterDownloadProcessor {
         urlSession: URLSession,
         onIncludeFetchError: IncludeResolver.FetchErrorHandler? = nil
     ) async throws -> (filter: FilterList, strippedDirectives: [String]) {
-        var expanded = try await expandSource(
+        let expanded = try await expandSource(
             data: data, sourceURL: sourceURL, filter: filter,
             urlSession: urlSession, onIncludeFetchError: onIncludeFetchError)
+        return try publish(expanded, containerURL: containerURL, etag: etag, lastModified: lastModified)
+    }
+
+    /// Compare the expanded rules when a known or previously untracked source is checked.
+    /// The caller can reuse the prepared result to publish without another include fetch.
+    public static func prepareChangedSource(
+        data: Data, sourceURL: URL, usedFallbackMirror: Bool, filter: FilterList, containerURL: URL,
+        urlSession: URLSession, onIncludeFetchError: IncludeResolver.FetchErrorHandler? = nil
+    ) async throws -> PreparedSource? {
+        if usedFallbackMirror, let text = String(data: data, encoding: .utf8),
+           let local = FilterListContentProcessing.localDataForComparison(filter: filter, containerURL: containerURL),
+           FilterUpdateResponseClassifier.isOlderMirror(text, than: local) {
+            return nil
+        }
+        let expanded = try await expandSource(
+            data: data, sourceURL: sourceURL, filter: filter,
+            urlSession: urlSession, onIncludeFetchError: onIncludeFetchError
+        )
+        guard expanded.data == FilterListContentProcessing.localDataForComparison(filter: filter, containerURL: containerURL)
+        else { return expanded }
+
+        let digest = expanded.normalizedDigest ?? DigestSupport.sha256Hex(expanded.data)
+        if let current = FilterListNormalizedDigest.state(for: filter, containerURL: containerURL) {
+            guard current.digest == digest, current.includeSource == expanded.includeSource else { return expanded }
+            if let baseline = expanded.baselineData, expanded.includeSource != nil,
+               FilterListNormalizedDigest.cachedParent(for: filter, containerURL: containerURL, state: current) != baseline {
+                return expanded
+            }
+            return nil
+        }
+
+        // Catalog unchanged legacy lists without replacing their source or creating a revision.
+        // Include parents need a normal publish to install their raw baseline under the same lock.
+        guard expanded.includeSource == nil else { return expanded }
+        let storeURL = containerURL.appendingPathComponent(PendingFilterUpdateRevisions.filename)
+        return try PendingFilterUpdateRevisions.withPublicationLock(for: storeURL) {
+            guard FilterListContentProcessing.localDataForComparison(filter: filter, containerURL: containerURL) == expanded.data,
+                  FilterListNormalizedDigest.state(for: filter, containerURL: containerURL) == nil else { return expanded }
+            FilterListNormalizedDigest.record(normalizedDigest: digest, for: filter, containerURL: containerURL, includeSource: nil)
+            return nil
+        }
+    }
+
+    public static func publish(
+        _ prepared: PreparedSource, containerURL: URL, etag: String?, lastModified: String?
+    ) throws -> (filter: FilterList, strippedDirectives: [String]) {
+        try Task.checkCancellation()
+        var expanded = prepared
         expanded.filter.etag = etag
         expanded.filter.serverLastModified = lastModified
 
+        let filter = expanded.filter
         let uuid = filter.id.uuidString
         let filename = ContentBlockerIncrementalCache.localFilename(for: filter)
         let fileURL = containerURL.appendingPathComponent(filename)
@@ -85,6 +135,7 @@ public enum FilterDownloadProcessor {
         let baselineData = expanded.baselineData
         let strippedDirectives = expanded.strippedDirectives
         let normalizedDigest = expanded.normalizedDigest ?? sourceSHA256
+        let includeSource = expanded.includeSource
         let revisionStoreURL = containerURL.appendingPathComponent(
             PendingFilterUpdateRevisions.filename,
             isDirectory: false
@@ -122,12 +173,14 @@ public enum FilterDownloadProcessor {
                         try? FileManager.default.removeItem(at: baselineURL)
                     }
                 }
+                FilterListNormalizedDigest.record(
+                    normalizedDigest: normalizedDigest, for: filter, containerURL: containerURL,
+                    includeSource: includeSource
+                )
             }
         ) != nil else {
             throw ProcessingError.publicationFailed
         }
-        FilterListNormalizedDigest.record(normalizedDigest: normalizedDigest, for: filter, containerURL: containerURL)
-
         return (filter: updatedFilter, strippedDirectives: strippedDirectives)
     }
 
@@ -139,7 +192,7 @@ public enum FilterDownloadProcessor {
         filter: FilterList,
         urlSession: URLSession,
         onIncludeFetchError: IncludeResolver.FetchErrorHandler?
-    ) async throws -> ExpandedSource {
+    ) async throws -> PreparedSource {
         guard data.count <= FilterListTooLargeError.maxBytes else {
             throw FilterListTooLargeError(ruleCount: nil)
         }
@@ -153,9 +206,11 @@ public enum FilterDownloadProcessor {
 
         let finalContent: String
         let preprocessedModified: Bool
+        let hasIncludes: Bool
         if filter.isOptimizedBuiltin {
             finalContent = normalized.content
             preprocessedModified = false
+            hasIncludes = false
         } else {
             let includeFailureTracker = IncludeFailureTracker()
             let preprocessor = FilterPreprocessor(
@@ -165,7 +220,7 @@ public enum FilterDownloadProcessor {
                     await onIncludeFetchError?(url, statusCode)
                 }
             )
-            (finalContent, preprocessedModified) = await preprocessor.preprocessWithChangeFlag(
+            (finalContent, preprocessedModified, hasIncludes) = await preprocessor.preprocessWithChangeFlag(
                 content: normalized.content,
                 listURL: sourceURL
             )
@@ -198,13 +253,14 @@ public enum FilterDownloadProcessor {
         updatedFilter.sourceSizeBytes = finalData.count
         updatedFilter.rawSourceRuleCount = normalized.rawCount
         updatedFilter.lastUpdated = Date()
-        return ExpandedSource(
+        return PreparedSource(
             data: finalData,
             filter: updatedFilter,
             strippedDirectives: normalized.strippedDirectives,
             // Stored as the raw body, so the delta baseline keeps the exact input bytes.
-            baselineData: normalized.hasDiffMetadata ? data : nil,
-            normalizedDigest: normalizedDigest
+            baselineData: normalized.hasDiffMetadata || hasIncludes ? data : nil,
+            normalizedDigest: normalizedDigest,
+            includeSource: hasIncludes ? sourceURL : nil
         )
     }
 

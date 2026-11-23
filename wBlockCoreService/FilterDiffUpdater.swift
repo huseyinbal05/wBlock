@@ -290,7 +290,9 @@ public enum FilterDiffUpdater {
                         fallbackLines!.removeSubrange(startIndex..<(startIndex + removable))
                     }
                 }
-                adjust -= count
+                let (nextAdjust, overflowed) = adjust.subtractingReportingOverflow(count)
+                guard !overflowed else { return nil }
+                adjust = nextAdjust
             case .add:
                 // `a<line> <count>`: insert `count` new lines (read from the
                 // following diff lines) at 0-based index `line`.
@@ -315,7 +317,9 @@ public enum FilterDiffUpdater {
                     }
                 }
                 diffIndex = insertionEnd
-                adjust += count
+                let (nextAdjust, overflowed) = adjust.addingReportingOverflow(count)
+                guard !overflowed else { return nil }
+                adjust = nextAdjust
             }
         }
 
@@ -429,7 +433,14 @@ public enum FilterDiffUpdater {
     private static func parseRCSCommand(_ line: Substring) -> RCSCommand? {
         let utf8 = line.utf8
         var index = utf8.startIndex
-        let end = utf8.endIndex
+        // The previous regex accepted a final line terminator before `$`. Keep
+        // it in patch payload lines, where it contributes to the checksum.
+        let end: String.Index
+        if let last = line.unicodeScalars.last, CharacterSet.newlines.contains(last) {
+            end = line.unicodeScalars.index(before: line.endIndex)
+        } else {
+            end = utf8.endIndex
+        }
         guard index < end else { return nil }
 
         let operation: RCSOperation

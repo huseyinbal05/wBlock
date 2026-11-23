@@ -82,6 +82,7 @@ public enum ConditionalEvaluator {
                 || bytes[afterIf] == UInt8(ascii: " ")
                 || bytes[afterIf] == UInt8(ascii: "\t")
                 || bytes[afterIf] == UInt8(ascii: "\n")
+                || bytes[afterIf] >= 0x80
         }
         return matchesBytes(bytes, at: afterIntro, "else")
             || matchesBytes(bytes, at: afterIntro, "endif")

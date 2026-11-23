@@ -348,12 +348,20 @@ struct FilterDiffUpdaterTests {
 
     static func testCRLFAndEmptyBaseline() {
         let crlfBaseline = "a\r\nb\r\nc\r\n"
-        let crlfDiff = "d2 1\na2 1\nX\r"
+        let crlfDiff = "d2 1\r\na2 1\r\nX\r\n"
+        let expected = "a\r\nX\r\nc\r\n"
         expectEqual(
             FilterDiffUpdater.applyRCSDiff(crlfDiff, to: crlfBaseline),
-            "a\r\nX\r\nc\r\n",
-            "applyRCSDiff splits strictly on LF and preserves CR"
+            expected,
+            "applyRCSDiff accepts CRLF commands and preserves CR in the payload"
         )
+        let checksum = Insecure.SHA1.hash(data: Data(expected.utf8)).map { String(format: "%02x", $0) }.joined()
+        let patch = "diff name:crlf lines:3 checksum:\(checksum)\r\n\(crlfDiff)"
+        let block = unwrap(FilterDiffUpdater.parsePatchFile(patch)?["crlf"], "CRLF patch header should parse")
+        guard case .success(let actual) = FilterDiffUpdater.applyBlock(block, to: crlfBaseline) else {
+            fail("CRLF patch must apply and verify its checksum")
+        }
+        expectEqual(actual, expected, "CRLF patch checksum covers the unchanged payload bytes")
 
         expectEqual(
             FilterDiffUpdater.applyRCSDiff("a0 1\nfirst", to: ""),
@@ -385,6 +393,7 @@ struct FilterDiffUpdaterTests {
             "d99999999999999999999999 1",
             "a1 999999999999999999999999\nx",
             "a1 2\nonly-one-line",
+            "d1 2\nd3 \(Int.max)",
         ] {
             expect(
                 FilterDiffUpdater.applyRCSDiff(badDiff, to: baseline) == nil,
