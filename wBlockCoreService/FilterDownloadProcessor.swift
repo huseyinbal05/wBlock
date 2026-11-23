@@ -40,6 +40,9 @@ public enum FilterDownloadProcessor {
         let strippedDirectives: [String]
         /// The raw body for uBO-style delta updates. Nil for lists without `! Diff-Path:`.
         let baselineData: Data?
+        /// Digest of the normalized unexpanded body when preprocessing modified the text;
+        /// nil when the saved `data` is already identical (`sourceSHA256` applies directly).
+        let normalizedDigest: String?
     }
 
     public static func processAndPublish(
@@ -81,6 +84,7 @@ public enum FilterDownloadProcessor {
         let updatedFilter = expanded.filter
         let baselineData = expanded.baselineData
         let strippedDirectives = expanded.strippedDirectives
+        let normalizedDigest = expanded.normalizedDigest ?? sourceSHA256
         let revisionStoreURL = containerURL.appendingPathComponent(
             PendingFilterUpdateRevisions.filename,
             isDirectory: false
@@ -122,6 +126,7 @@ public enum FilterDownloadProcessor {
         ) != nil else {
             throw ProcessingError.publicationFailed
         }
+        FilterListNormalizedDigest.record(normalizedDigest: normalizedDigest, for: filter, containerURL: containerURL)
 
         return (filter: updatedFilter, strippedDirectives: strippedDirectives)
     }
@@ -147,8 +152,10 @@ public enum FilterDownloadProcessor {
         }
 
         let finalContent: String
+        let preprocessedModified: Bool
         if filter.isOptimizedBuiltin {
             finalContent = normalized.content
+            preprocessedModified = false
         } else {
             let includeFailureTracker = IncludeFailureTracker()
             let preprocessor = FilterPreprocessor(
@@ -158,7 +165,7 @@ public enum FilterDownloadProcessor {
                     await onIncludeFetchError?(url, statusCode)
                 }
             )
-            finalContent = await preprocessor.preprocess(
+            (finalContent, preprocessedModified) = await preprocessor.preprocessWithChangeFlag(
                 content: normalized.content,
                 listURL: sourceURL
             )
@@ -167,6 +174,7 @@ public enum FilterDownloadProcessor {
                 throw ProcessingError.invalidContent
             }
         }
+        let normalizedDigest = preprocessedModified ? DigestSupport.sha256Hex(normalized.content) : nil
 
         try Task.checkCancellation()
         guard FilterListContentValidator.appearsToBeFilterList(finalContent),
@@ -184,7 +192,9 @@ public enum FilterDownloadProcessor {
             version: metadata.version,
             to: filter
         )
-        updatedFilter.sourceRuleCount = FilterList.countRules(in: finalContent)
+        updatedFilter.sourceRuleCount = preprocessedModified
+            ? FilterList.countRules(in: finalContent)
+            : normalized.rawCount
         updatedFilter.sourceSizeBytes = finalData.count
         updatedFilter.rawSourceRuleCount = normalized.rawCount
         updatedFilter.lastUpdated = Date()
@@ -193,7 +203,8 @@ public enum FilterDownloadProcessor {
             filter: updatedFilter,
             strippedDirectives: normalized.strippedDirectives,
             // Stored as the raw body, so the delta baseline keeps the exact input bytes.
-            baselineData: normalized.hasDiffMetadata ? data : nil
+            baselineData: normalized.hasDiffMetadata ? data : nil,
+            normalizedDigest: normalizedDigest
         )
     }
 

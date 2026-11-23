@@ -2211,7 +2211,6 @@ public actor SharedAutoUpdateManager {
                     )
                 }
             )
-            FilterListNormalizedDigest.record(body: data, for: filter, containerURL: containerURL)
             if !processed.strippedDirectives.isEmpty {
                 appendSharedLog(
                     "Stripped unknown directives: filter=\(filter.name), directives=\(processed.strippedDirectives.joined(separator: ", "))"

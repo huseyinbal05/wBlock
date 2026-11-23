@@ -772,7 +772,8 @@ public enum ContentBlockerIncrementalCache {
         let filename = localFilename(for: filter)
         let urls = [
             containerURL.appendingPathComponent(filename),
-            containerURL.appendingPathComponent("diff-baseline-\(filename)")
+            containerURL.appendingPathComponent("diff-baseline-\(filename)"),
+            containerURL.appendingPathComponent("\(filename).normalized-sha256")
         ]
 
         var firstError: Error?

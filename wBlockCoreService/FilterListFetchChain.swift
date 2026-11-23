@@ -381,10 +381,17 @@ public enum FilterListNormalizedDigest {
 
     /// Call after the saved file holds `body`, so the identity names the bytes just written.
     public static func record(body: Data, for filter: FilterList, containerURL: URL) {
+        let digest = DigestSupport.sha256Hex(FilterListContentProcessing.normalizedContent(from: String(decoding: body, as: UTF8.self)))
+        record(normalizedDigest: digest, for: filter, containerURL: containerURL)
+    }
+
+    public static func record(normalizedDigest: String, for filter: FilterList, containerURL: URL) {
         let fileURL = savedFileURL(for: filter, containerURL: containerURL)
         guard let saved = identity(of: fileURL) else { return }
-        let digest = DigestSupport.sha256Hex(FilterListContentProcessing.normalizedContent(from: String(decoding: body, as: UTF8.self)))
-        try? "\(digest)|\(saved)".write(to: sidecarURL(for: filter, containerURL: containerURL), atomically: true, encoding: .utf8)
+        try? FilterArtifactStorage.write(
+            Data("\(normalizedDigest)|\(saved)".utf8),
+            to: sidecarURL(for: filter, containerURL: containerURL)
+        )
     }
 
     /// The recorded digest, or nil when the saved file has changed since it was recorded.

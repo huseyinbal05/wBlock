@@ -229,6 +229,7 @@ compile_core_test filter-catalog-migrations scripts/test_filter_catalog_migratio
   wBlock/ConcurrentLogManager.swift wBlock/LogTimeZone.swift
 compile_core_test filter-list-fetch-chain scripts/test_filter_list_fetch_chain.swift
 compile_core_test filter-download-processor scripts/test_filter_download_processor.swift
+compile_core_test filter-download-pipeline-fast-paths scripts/test_filter_download_pipeline_fast_paths.swift
 compile_core_test issue-508-backup scripts/test_issue_508_backup_userscript.swift
 compile_core_test backup-restore scripts/test_backup_restore.swift wBlock/BackupManager.swift
 compile_core_test protobuf-reliability scripts/test_protobuf_reliability.swift

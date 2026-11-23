@@ -262,7 +262,8 @@ final class FilterListUpdater: @unchecked Sendable {
             let responseStatus = FilterUpdateResponseClassifier.classify(
                 statusCode: httpResponse.statusCode, responseData: data,
                 localData: self.localDataForComparison(filter: filter),
-                usedFallbackMirror: result.servedFallback)
+                usedFallbackMirror: result.servedFallback,
+                localNormalizedDigest: self.localNormalizedDigest(for: filter))
 
             if result.servedFallback {
                 await pendingValidatorUpdates.add(
@@ -331,6 +332,11 @@ final class FilterListUpdater: @unchecked Sendable {
             filter: filter,
             containerURL: containerURL
         )
+    }
+
+    private func localNormalizedDigest(for filter: FilterList) -> String? {
+        guard let containerURL = loader.getSharedContainerURL() else { return nil }
+        return FilterListNormalizedDigest.load(for: filter, containerURL: containerURL)
     }
 
     /// Fetches, processes, and saves a filter list.
@@ -445,7 +451,8 @@ final class FilterListUpdater: @unchecked Sendable {
         if !FilterUpdateResponseClassifier.contentDiffers(
             remoteData: download.data,
             localData: localDataForComparison(filter: filter),
-            usedFallbackMirror: download.servedFallback
+            usedFallbackMirror: download.servedFallback,
+            localNormalizedDigest: localNormalizedDigest(for: filter)
         ) {
             if responseEtag != nil || responseLastModified != nil {
                 await ProtobufDataManager.shared.setFilterValidators(
