@@ -699,7 +699,7 @@ class AppFilterManager: ObservableObject {
         )
         for url in contents {
             let filename = url.lastPathComponent
-            guard (filename.hasSuffix(".txt") || filename.hasSuffix(".txt.normalized-sha256")),
+            guard filename.hasSuffix(".txt"),
                   orphanPrefixes.contains(where: filename.hasPrefix)
             else { continue }
             do {
@@ -730,7 +730,6 @@ class AppFilterManager: ObservableObject {
         if let container = loader.getSharedContainerURL() {
             let sources = filterLists.filter { !$0.isCustom }.map(ContentBlockerIncrementalCache.localFilename)
             let baselines = filterLists.map { "diff-baseline-\(ContentBlockerIncrementalCache.localFilename(for: $0))" }
-            let normalizedDigests = filterLists.map { "\(ContentBlockerIncrementalCache.localFilename(for: $0)).normalized-sha256" }
             let rules = ContentBlockerTargetManager.shared.targets.flatMap { target -> [String] in
                 let base = ContentBlockerIncrementalCache.baseRulesFilename(for: target.rulesFilename)
                 return [target.rulesFilename, base, "\(base).count", "\(base).sha256",
@@ -738,7 +737,7 @@ class AppFilterManager: ObservableObject {
                         ContentBlockerIncrementalCache.baseAdvancedRulesFilename(for: target.rulesFilename),
                         "\(target.rulesFilename).incremental-state.json", "\(target.rulesFilename).source-rule-provenance.json"]
             }
-            let generated = sources + baselines + normalizedDigests + rules + [
+            let generated = sources + baselines + rules + [
                 RemoveParamDNRRuleGenerator.rulesFilename, RemoveParamDNRRuleGenerator.blockedCountRulesFilename,
                 RemoveParamDNRRuleGenerator.pageRulesFilename, "dnr-generation-state.json",
                 "dnr-extraction-cache.json", "removeparam-extraction-cache.json"

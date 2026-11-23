@@ -85,8 +85,6 @@ func waitUntil(_ condition: () -> Bool) async {
         check(FilterUpdateResponseClassifier.classify(statusCode: 200, responseData: Data("404: Not Found".utf8), localData: nil) == .invalidContent, "404 body invalid")
         var readLocal = false
         check(FilterUpdateResponseClassifier.classify(statusCode: 304, responseData: nil, localData: { readLocal = true; return nil }()) == .notModified && !readLocal, "304 skips the saved list")
-        var readDigest = false
-        check(FilterUpdateResponseClassifier.classify(statusCode: 304, responseData: nil, localData: nil, localNormalizedDigest: { readDigest = true; return nil }()) == .notModified && !readDigest, "304 skips the digest comparison")
         let crlf = Data("! Title: T\r\n!#unknown\r\n||a.com^\r\n".utf8)
         let saved = Data(FilterListContentProcessing.normalizedContent(from: String(decoding: crlf, as: UTF8.self)).utf8)
         check(FilterUpdateResponseClassifier.classify(statusCode: 200, responseData: crlf, localData: saved) == .unchangedContent, "CRLF body matches its saved form")

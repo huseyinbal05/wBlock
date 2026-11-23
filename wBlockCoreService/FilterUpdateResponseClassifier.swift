@@ -24,7 +24,7 @@ public enum FilterUpdateResponseClassifier {
         responseData: Data?,
         localData: @autoclosure () -> Data?,
         usedFallbackMirror: Bool = false,
-        localNormalizedDigest: @autoclosure () -> String? = nil
+        localNormalizedDigest: String? = nil
     ) -> FilterUpdateResponseStatus {
         switch statusCode {
         case 304:
@@ -35,7 +35,7 @@ public enum FilterUpdateResponseClassifier {
             }
             return contentDiffers(
                 remoteData: responseData, localData: localData(),
-                usedFallbackMirror: usedFallbackMirror, localNormalizedDigest: localNormalizedDigest())
+                usedFallbackMirror: usedFallbackMirror, localNormalizedDigest: localNormalizedDigest)
                 ? .updatedContent
                 : .unchangedContent
         default:
@@ -88,35 +88,18 @@ public enum FilterUpdateResponseClassifier {
     ) -> Bool {
         guard let localData else { return true }
         guard remoteData != localData else { return false }
-        guard let remoteText = String(data: remoteData, encoding: .utf8) else { return true }
-        if usedFallbackMirror, isOlderMirror(remoteText, than: localData) {
+        let remoteText = String(decoding: remoteData, as: UTF8.self)
+        if usedFallbackMirror,
+           let remoteVersion = numericVersion(remoteText),
+           let localVersion = numericVersion(String(decoding: localData.prefix(16_384), as: UTF8.self)),
+           UserScript.isVersionNewer(localVersion, than: remoteVersion) {
             return false
         }
-        var normalizedText = FilterListContentProcessing.normalizedContent(from: remoteText)
+        let normalized = Data(FilterListContentProcessing.normalizedContent(from: remoteText).utf8)
         if let localNormalizedDigest {
-            return DigestSupport.sha256Hex(normalizedText) != localNormalizedDigest
+            return sha256Hex(normalized) != localNormalizedDigest
         }
-        normalizedText.makeContiguousUTF8()
-        if let equal = normalizedText.utf8.withContiguousStorageIfAvailable({ remoteBytes in
-            guard remoteBytes.count == localData.count else { return false }
-            return localData.withUnsafeBytes { localBytes in
-                guard let remoteBase = remoteBytes.baseAddress, let localBase = localBytes.baseAddress else {
-                    return remoteBytes.isEmpty && localData.isEmpty
-                }
-                return memcmp(remoteBase, localBase, remoteBytes.count) == 0
-            }
-        }) {
-            return !equal
-        }
-        return !normalizedText.utf8.elementsEqual(localData)
-    }
-
-    static func isOlderMirror(_ remoteText: String, than localData: Data) -> Bool {
-        let prefix = localData.prefix(16_384)
-        let localText = String(data: prefix, encoding: .utf8) ?? String(decoding: prefix, as: UTF8.self)
-        guard let remoteVersion = numericVersion(remoteText),
-              let localVersion = numericVersion(localText) else { return false }
-        return UserScript.isVersionNewer(localVersion, than: remoteVersion)
+        return normalized != localData
     }
 
     /// Only dotted numbers order reliably; some lists stamp a date instead.

@@ -50,7 +50,6 @@ public actor IncludeResolver {
     private struct ExpansionResult {
         let lines: [String]
         let bytes: Int
-        var hasIncludes = false
     }
 
     // MARK: - Initializer
@@ -105,24 +104,14 @@ public actor IncludeResolver {
         visited: Set<String>,
         depth: Int
     ) async -> [String] {
-        await expandIncludesTrackingDependencies(in: lines, baseURL: baseURL, visited: visited, depth: depth).lines
-    }
-
-    func expandIncludesTrackingDependencies(
-        in lines: [String],
-        baseURL: URL,
-        visited: Set<String>,
-        depth: Int
-    ) async -> (lines: [String], hasIncludes: Bool) {
-        let result = await expandIncludes(
+        await expandIncludes(
             in: lines,
             baseURL: baseURL,
             visited: visited,
             depth: depth,
             maximumLines: Self.maxExpandedLines,
             maximumBytes: Self.maxExpandedBytes
-        )
-        return (result.lines, result.hasIncludes)
+        ).lines
     }
 
     /// Resolves a single `!#include` line into the expanded lines from the referenced sub-list.
@@ -163,14 +152,13 @@ public actor IncludeResolver {
         var result: [String] = []
         result.reserveCapacity(min(lines.count, maximumLines))
         var resultBytes = 0
-        var hasIncludes = false
 
         for line in lines {
             guard result.count < maximumLines, resultBytes < maximumBytes else { break }
-            let trimmed = ConditionalEvaluator.trimmedDirectiveLine(line)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if Self.includePath(from: trimmed) != nil {
                 let expanded = await resolve(
-                    includeLine: String(trimmed),
+                    includeLine: trimmed,
                     baseURL: baseURL,
                     visited: visited,
                     depth: depth,
@@ -179,7 +167,6 @@ public actor IncludeResolver {
                 )
                 result.append(contentsOf: expanded.lines)
                 resultBytes += expanded.bytes
-                hasIncludes = hasIncludes || expanded.hasIncludes
             } else {
                 let lineBytes = line.utf8.count + 1
                 guard resultBytes + lineBytes <= maximumBytes else { break }
@@ -187,7 +174,7 @@ public actor IncludeResolver {
                 resultBytes += lineBytes
             }
         }
-        return ExpansionResult(lines: result, bytes: resultBytes, hasIncludes: hasIncludes)
+        return ExpansionResult(lines: result, bytes: resultBytes)
     }
 
     private func resolve(
@@ -238,7 +225,7 @@ public actor IncludeResolver {
             let evaluated = ConditionalEvaluator.evaluate(
                 lines: content.components(separatedBy: .newlines)
             )
-            var result = await expandIncludes(
+            return await expandIncludes(
                 in: evaluated,
                 baseURL: subURL.deletingLastPathComponent(),
                 visited: nextVisited,
@@ -246,8 +233,6 @@ public actor IncludeResolver {
                 maximumLines: maximumLines,
                 maximumBytes: maximumBytes
             )
-            result.hasIncludes = true
-            return result
         } catch {
             await onFetchError?(subURL, nil)
             return ExpansionResult(lines: [], bytes: 0)
@@ -262,23 +247,10 @@ public actor IncludeResolver {
     /// EasyList template aliases such as `%include easylist:foo.txt%` name a
     /// repository the list does not point at, so they are not includes we can fetch.
     public static func includePath(from line: String) -> String? {
-        includePath(from: line[...])
-    }
-
-    /// Fast prefix check used by `FilterPreprocessor`'s pass-through scan so all
-    /// include directive syntax stays owned by `IncludeResolver`.
-    static func startsWithDirective(_ bytes: UnsafeBufferPointer<UInt8>, at index: Int) -> Bool {
-        ConditionalEvaluator.matchesBytes(bytes, at: index, "!#include")
-            || ConditionalEvaluator.matchesBytes(bytes, at: index, "%include ")
-    }
-
-    static func includePath(from line: Substring) -> String? {
-        let utf8 = line.utf8
-        guard let first = utf8.first else { return nil }
-        if first == UInt8(ascii: "!"), line.hasPrefix("!#include") {
+        if line.hasPrefix("!#include") {
             return String(line.dropFirst("!#include".count)).trimmingCharacters(in: .whitespaces)
         }
-        guard first == UInt8(ascii: "%"), line.hasPrefix("%include "), line.hasSuffix("%") else { return nil }
+        guard line.hasPrefix("%include "), line.hasSuffix("%") else { return nil }
         let path = line.dropFirst("%include ".count).dropLast().trimmingCharacters(in: .whitespaces)
         guard !path.contains(":") || path.hasPrefix("https://") else { return nil }
         return path

@@ -31,14 +31,11 @@ final class FilterListUpdater: @unchecked Sendable {
         let servedFallback: Bool
         let etag: String?
         let lastModified: String?
-        let requiresExpandedComparison: Bool
-        var prepared: FilterDownloadProcessor.PreparedSource?
 
         init(from result: FilterListFetchResult) {
             data = result.data
             sourceURL = result.sourceURL
             servedFallback = result.servedFallback
-            requiresExpandedComparison = result.requiresExpandedComparison
             if result.servedFallback {
                 etag = nil
                 lastModified = nil
@@ -262,26 +259,14 @@ final class FilterListUpdater: @unchecked Sendable {
             let result = try await fetch(filter, validators: validators, patches: patches, timeout: 12)
             let data = result.data
             let httpResponse = result.response
-            var download = CachedFilterDownload(from: result)
+            let responseStatus = FilterUpdateResponseClassifier.classify(
+                statusCode: httpResponse.statusCode, responseData: data,
+                localData: self.localDataForComparison(filter: filter),
+                usedFallbackMirror: result.servedFallback)
 
             if result.servedFallback {
                 await pendingValidatorUpdates.add(
                     uuid: filter.id.uuidString, etag: nil, lastModified: nil)
-            }
-
-            let responseStatus: FilterUpdateResponseStatus
-            if result.requiresExpandedComparison, httpResponse.statusCode == 200,
-               FilterUpdateResponseClassifier.looksLikeFilterListData(data),
-               let containerURL = loader.getSharedContainerURL() {
-                download.prepared = try await prepareChangedSource(download, filter: filter, containerURL: containerURL)
-                responseStatus = download.prepared == nil ? .unchangedContent : .updatedContent
-            } else {
-                responseStatus = FilterUpdateResponseClassifier.classify(
-                    statusCode: httpResponse.statusCode, responseData: data,
-                    localData: self.localDataForComparison(filter: filter),
-                    usedFallbackMirror: result.servedFallback,
-                    localNormalizedDigest: self.localNormalizedDigest(for: filter)
-                )
             }
 
             switch responseStatus {
@@ -289,7 +274,7 @@ final class FilterListUpdater: @unchecked Sendable {
                 return false
             case .updatedContent:
                 await pendingDownloads.store(
-                    filter.id, download: download)
+                    filter.id, download: CachedFilterDownload(from: result))
                 return true
             case .unchangedContent:
                 // A successful primary response may refresh its validators.
@@ -330,11 +315,14 @@ final class FilterListUpdater: @unchecked Sendable {
         patches: FilterPatchCache,
         timeout: TimeInterval
     ) async throws -> FilterListFetchResult {
-        try await FilterListFetchChain.fetchUpdate(
-            for: filter, containerURL: loader.getSharedContainerURL(), session: urlSession,
+        try await FilterListFetchChain.fetch(
+            session: urlSession, primaryURL: filter.url,
+            fallbackURLs: FilterListURLMirror.fallbackURLs(for: filter.url),
             etag: validators.etag, lastModified: validators.lastModified, timeout: timeout,
-            patches: patches
-        )
+            diffBaselineURL: loader.getSharedContainerURL().map {
+                FilterListFetchChain.diffBaselineURL(for: filter, containerURL: $0)
+            },
+            patches: patches)
     }
 
     private func localDataForComparison(filter: FilterList) -> Data? {
@@ -343,11 +331,6 @@ final class FilterListUpdater: @unchecked Sendable {
             filter: filter,
             containerURL: containerURL
         )
-    }
-
-    private func localNormalizedDigest(for filter: FilterList) -> String? {
-        guard let containerURL = loader.getSharedContainerURL() else { return nil }
-        return FilterListNormalizedDigest.load(for: filter, containerURL: containerURL)
     }
 
     /// Fetches, processes, and saves a filter list.
@@ -459,40 +442,50 @@ final class FilterListUpdater: @unchecked Sendable {
         }
         let responseEtag = download.etag
         let responseLastModified = download.lastModified
+        if !FilterUpdateResponseClassifier.contentDiffers(
+            remoteData: download.data,
+            localData: localDataForComparison(filter: filter),
+            usedFallbackMirror: download.servedFallback
+        ) {
+            if responseEtag != nil || responseLastModified != nil {
+                await ProtobufDataManager.shared.setFilterValidators(
+                    uuid,
+                    etag: responseEtag,
+                    lastModified: responseLastModified
+                )
+            }
+            return .unchanged
+        }
+
         guard let containerURL = loader.getSharedContainerURL() else {
             await ConcurrentLogManager.shared.error(
                 .system, LocalizedStrings.text("Unable to access shared container"), metadata: [:])
             return .failed
         }
 
-        let result: (filter: FilterList, strippedDirectives: [String])?
+        let processed: (filter: FilterList, strippedDirectives: [String])
         do {
-            if download.requiresExpandedComparison {
-                let prepared: FilterDownloadProcessor.PreparedSource?
-                if let cached = download.prepared {
-                    prepared = cached
-                } else {
-                    prepared = try await prepareChangedSource(download, filter: filter, containerURL: containerURL)
-                }
-                result = try prepared.map {
-                    try FilterDownloadProcessor.publish(
-                        $0, containerURL: containerURL, etag: responseEtag, lastModified: responseLastModified
+            processed = try await FilterDownloadProcessor.processAndPublish(
+                data: download.data,
+                sourceURL: download.sourceURL,
+                filter: filter,
+                containerURL: containerURL,
+                etag: responseEtag,
+                lastModified: responseLastModified,
+                urlSession: urlSession,
+                onIncludeFetchError: { subURL, statusCode in
+                    let statusStr = statusCode.map { "\($0)" } ?? "network error"
+                    await ConcurrentLogManager.shared.warning(
+                        .filterUpdate,
+                        LocalizedStrings.text("!#include fetch failed"),
+                        metadata: [
+                            "filter": filter.name,
+                            "subURL": subURL.absoluteString,
+                            "status": statusStr,
+                        ]
                     )
                 }
-            } else if FilterUpdateResponseClassifier.contentDiffers(
-                remoteData: download.data,
-                localData: localDataForComparison(filter: filter),
-                usedFallbackMirror: download.servedFallback,
-                localNormalizedDigest: localNormalizedDigest(for: filter)
-            ) {
-                result = try await FilterDownloadProcessor.processAndPublish(
-                    data: download.data, sourceURL: download.sourceURL, filter: filter, containerURL: containerURL,
-                    etag: responseEtag, lastModified: responseLastModified, urlSession: urlSession,
-                    onIncludeFetchError: includeErrorHandler(for: filter)
-                )
-            } else {
-                result = nil
-            }
+            )
         } catch let tooLarge as FilterListTooLargeError {
             await ConcurrentLogManager.shared.error(
                 .filterUpdate,
@@ -508,13 +501,6 @@ final class FilterListUpdater: @unchecked Sendable {
                 metadata: ["filter": filter.name, "error": LogErrorDescriber.describe(error)]
             )
             return .failed
-        }
-
-        guard let processed = result else {
-            if responseEtag != nil || responseLastModified != nil {
-                await ProtobufDataManager.shared.setFilterValidators(uuid, etag: responseEtag, lastModified: responseLastModified)
-            }
-            return .unchanged
         }
 
         if !processed.strippedDirectives.isEmpty {
@@ -560,26 +546,6 @@ final class FilterListUpdater: @unchecked Sendable {
 
     func fetchAndProcessFilter(_ filter: FilterList) async -> Bool {
         await fetchAndProcessFilterResult(filter, patches: FilterPatchCache()).succeeded
-    }
-
-    private func prepareChangedSource(
-        _ download: CachedFilterDownload, filter: FilterList, containerURL: URL
-    ) async throws -> FilterDownloadProcessor.PreparedSource? {
-        try await FilterDownloadProcessor.prepareChangedSource(
-            data: download.data, sourceURL: download.sourceURL, usedFallbackMirror: download.servedFallback,
-            filter: filter, containerURL: containerURL, urlSession: urlSession,
-            onIncludeFetchError: includeErrorHandler(for: filter)
-        )
-    }
-
-    private func includeErrorHandler(for filter: FilterList) -> IncludeResolver.FetchErrorHandler {
-        { subURL, statusCode in
-            let status = statusCode.map(String.init) ?? "network error"
-            await ConcurrentLogManager.shared.warning(
-                .filterUpdate, LocalizedStrings.text("!#include fetch failed"),
-                metadata: ["filter": filter.name, "subURL": subURL.absoluteString, "status": status]
-            )
-        }
     }
 
     private func refreshFilters(

@@ -65,13 +65,7 @@ public actor FilterPreprocessor {
     ///             Used both as the origin for same-origin checks and as the self-cycle guard.
     /// - Returns: Fully expanded filter list content, ready for SafariConverterLib.
     public func preprocess(content: String, listURL: URL) async -> String {
-        await preprocessWithChangeFlag(content: content, listURL: listURL).content
-    }
-
-    func preprocessWithChangeFlag(content: String, listURL: URL) async -> (content: String, modified: Bool, hasIncludes: Bool) {
-        if Self.canPassThroughUnchanged(content) {
-            return (content, false, false)
-        }
+        if Self.canPassThroughUnchanged(content) { return content }
 
         // Step 1: Split into lines
         let lines = content.components(separatedBy: .newlines)
@@ -93,7 +87,7 @@ public actor FilterPreprocessor {
 
         // Step 5: Expand all !#include directives recursively.
         // Depth starts at 0; IncludeResolver increments on each level of recursion.
-        let expanded = await resolver.expandIncludesTrackingDependencies(
+        let expanded = await resolver.expandIncludes(
             in: evaluated,
             baseURL: baseURL,
             visited: visited,
@@ -101,60 +95,62 @@ public actor FilterPreprocessor {
         )
 
         // Step 6: Join and return as a single string for SafariConverterLib.
-        return (expanded.lines.joined(separator: "\n"), true, expanded.hasIncludes)
+        return expanded.joined(separator: "\n")
     }
 
-    static func mayContainIncludes(_ data: Data) -> Bool {
-        data.range(of: Data("!#include".utf8)) != nil || data.range(of: Data("%include ".utf8)) != nil
-    }
-
-    /// Returns true only when `content` has LF-only line breaks, stays within line/byte
-    /// expansion limits, and contains no conditional or include directives
-    /// so preprocessing would return the exact same string unchanged.
+    /// A plain LF list within the expansion limits needs no line arrays.
     private static func canPassThroughUnchanged(_ content: String) -> Bool {
         guard content.utf8.count < IncludeResolver.maxExpandedBytes else { return false }
-        var copy = content
-        copy.makeContiguousUTF8()
-        return copy.utf8.withContiguousStorageIfAvailable { bytes -> Bool in
-            let count = bytes.count
-            var lfCount = 0
-            var i = 0
+        var content = content
+        return content.withUTF8 { bytes in
+            var lineBreaks = 0
             var atLineStart = true
-
-            while i < count {
-                let b = bytes[i]
+            for index in bytes.indices {
+                let byte = bytes[index]
                 if atLineStart {
-                    if b == UInt8(ascii: " ") || b == UInt8(ascii: "\t") {
-                        i += 1
-                        continue
-                    }
-                    if b >= 0x80 {
+                    if byte == 0x20 || byte == 0x09 { continue }
+                    if byte >= 0x80 || ((byte == 0x21 || byte == 0x25) && hasDirective(in: bytes[index...])) {
                         return false
                     }
                     atLineStart = false
-                    if b == UInt8(ascii: "!") || b == UInt8(ascii: "%") {
-                        if ConditionalEvaluator.startsWithDirective(bytes, at: i)
-                            || IncludeResolver.startsWithDirective(bytes, at: i)
-                        {
-                            return false
-                        }
-                    }
                 }
-                if b == UInt8(ascii: "\n") {
-                    lfCount += 1
-                    if lfCount >= IncludeResolver.maxExpandedLines { return false }
+                switch byte {
+                case 0x0A:
+                    lineBreaks += 1
+                    if lineBreaks >= IncludeResolver.maxExpandedLines { return false }
                     atLineStart = true
-                } else if b >= 0x0B && b <= 0x0D {
+                case 0x0B...0x0D:
                     return false
-                } else if b == 0xC2, i + 1 < count, bytes[i + 1] == 0x85 {
+                case 0xC2 where index + 1 < bytes.count && bytes[index + 1] == 0x85:
                     return false
-                } else if b == 0xE2, i + 2 < count, bytes[i + 1] == 0x80,
-                          bytes[i + 2] == 0xA8 || bytes[i + 2] == 0xA9 {
-                    return false
+                case 0xE2 where index + 2 < bytes.count && bytes[index + 1] == 0x80:
+                    if bytes[index + 2] == 0xA8 || bytes[index + 2] == 0xA9 { return false }
+                default:
+                    break
                 }
-                i += 1
             }
             return true
-        } ?? false
+        }
+    }
+
+    /// Conservatively leave directive parsing to the full preprocessor.
+    private static func hasDirective(in bytes: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
+        func startsWith(_ prefix: StaticString) -> Bool {
+            bytes.starts(with: UnsafeBufferPointer(start: prefix.utf8Start, count: prefix.utf8CodeUnitCount))
+        }
+        switch bytes.first {
+        case 0x21:
+            if startsWith("!#if") {
+                let after = bytes.startIndex + 4
+                if after == bytes.endIndex { return true }
+                let separator = bytes[after]
+                return separator == 0x20 || separator == 0x09 || separator == 0x0A || separator >= 0x80
+            }
+            return startsWith("!#else") || startsWith("!#endif") || startsWith("!#include")
+        case 0x25:
+            return startsWith("%include ")
+        default:
+            return false
+        }
     }
 }
