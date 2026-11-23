@@ -5,12 +5,17 @@ public struct FilterListFetchResult: Sendable {
     public let response: HTTPURLResponse
     public let sourceURL: URL
     public let servedFallback: Bool
+    public let requiresExpandedComparison: Bool
 
     /// The same fact as `servedFallback`, under the name the response classifier takes.
     public var usedFallbackMirror: Bool { servedFallback }
 
-    public init(data: Data, response: HTTPURLResponse, sourceURL: URL, servedFallback: Bool) {
+    public init(
+        data: Data, response: HTTPURLResponse, sourceURL: URL, servedFallback: Bool,
+        requiresExpandedComparison: Bool = false
+    ) {
         self.data = data; self.response = response; self.sourceURL = sourceURL; self.servedFallback = servedFallback
+        self.requiresExpandedComparison = requiresExpandedComparison
     }
 }
 
@@ -63,6 +68,61 @@ public enum FilterListFetchChain {
     /// which that list's next patch applies to.
     public static func diffBaselineURL(for filter: FilterList, containerURL: URL) -> URL {
         containerURL.appendingPathComponent("diff-baseline-\(ContentBlockerIncrementalCache.localFilename(for: filter))")
+    }
+
+    /// A parent may be unchanged even though its included files have changed.
+    /// Reuse its exact raw body on a 304, including a 304 synthesized by the delta path.
+    public static func fetchUpdate(
+        for filter: FilterList, containerURL: URL?, session: URLSession,
+        etag: String?, lastModified: String?, timeout: TimeInterval, patches: FilterPatchCache,
+        hedgedFallback: Bool = false, log: (@Sendable (String) async -> Void)? = nil
+    ) async throws -> FilterListFetchResult {
+        let cached = containerURL.flatMap { FilterListNormalizedDigest.state(for: filter, containerURL: $0) }
+        // Older downloads have no include metadata. Inspect their next full response once.
+        let needsInspection = !filter.isOptimizedBuiltin && cached == nil && containerURL.map {
+            ContentBlockerIncrementalCache.existingLocalFileURL(for: filter, containerURL: $0) != nil
+        } == true
+        func fetchParent(unconditional: Bool) async throws -> FilterListFetchResult {
+            try await fetch(
+                session: session, primaryURL: filter.url,
+                fallbackURLs: FilterListURLMirror.fallbackURLs(for: filter.url),
+                etag: unconditional ? nil : etag, lastModified: unconditional ? nil : lastModified,
+                timeout: timeout, diffBaselineURL: unconditional ? nil : containerURL.map {
+                    diffBaselineURL(for: filter, containerURL: $0)
+                }, patches: patches, hedgedFallback: hedgedFallback, log: log
+            )
+        }
+
+        let result = try await fetchParent(unconditional: needsInspection)
+        guard let containerURL, let cached, let includeSource = cached.includeSource else {
+            guard needsInspection else { return result }
+            return FilterListFetchResult(
+                data: result.data, response: result.response, sourceURL: result.sourceURL,
+                servedFallback: result.servedFallback, requiresExpandedComparison: true
+            )
+        }
+
+        let parent: FilterListFetchResult
+        if result.response.statusCode == 304 {
+            if includeSource == result.sourceURL,
+               let body = FilterListNormalizedDigest.cachedParent(for: filter, containerURL: containerURL, state: cached) {
+                var headers: [String: String] = [:]
+                headers["ETag"] = result.response.value(forHTTPHeaderField: "ETag") ?? etag
+                headers["Last-Modified"] = result.response.value(forHTTPHeaderField: "Last-Modified") ?? lastModified
+                let response = HTTPURLResponse(
+                    url: result.sourceURL, statusCode: 200, httpVersion: nil, headerFields: headers
+                )!
+                parent = FilterListFetchResult(data: body, response: response, sourceURL: result.sourceURL, servedFallback: false)
+            } else {
+                parent = try await fetchParent(unconditional: true)
+            }
+        } else {
+            parent = result
+        }
+        return FilterListFetchResult(
+            data: parent.data, response: parent.response, sourceURL: parent.sourceURL,
+            servedFallback: parent.servedFallback, requiresExpandedComparison: true
+        )
     }
 
     /// Reads `! Expires: <n> days|hours|minutes` (or `6h`, `4d`, `1 day`) from the
@@ -358,11 +418,14 @@ public enum FilterListFetchChain {
     }
 }
 
-/// SHA-256 of a saved list's normalized body from before `!#include` expansion.
-/// The saved bytes are expanded, so a 200 without validators can only be compared
-/// against this digest. The sidecar records the saved file's size and mtime, so a
-/// file another path rewrote never matches a digest from an earlier download.
+/// The normalized parent digest and, for expanded lists, the identity of its raw baseline.
 public enum FilterListNormalizedDigest {
+    struct State: Codable, Equatable {
+        let digest: String
+        let sourceIdentity: String
+        let includeSource: URL?
+        let baselineIdentity: String?
+    }
     private static func sidecarURL(for filter: FilterList, containerURL: URL) -> URL {
         containerURL.appendingPathComponent("\(ContentBlockerIncrementalCache.localFilename(for: filter)).normalized-sha256")
     }
@@ -371,30 +434,48 @@ public enum FilterListNormalizedDigest {
         containerURL.appendingPathComponent(ContentBlockerIncrementalCache.localFilename(for: filter))
     }
 
-    /// `size|mtime` of the saved file, or nil when it does not exist.
     private static func identity(of url: URL) -> String? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let inode = attributes[.systemFileNumber],
               let size = attributes[.size], let modified = attributes[.modificationDate] as? Date
         else { return nil }
-        return "\(size)|\(modified.timeIntervalSince1970)"
+        return "\(inode)|\(size)|\(modified.timeIntervalSince1970)"
     }
 
-    /// Call after the saved file holds `body`, so the identity names the bytes just written.
-    public static func record(body: Data, for filter: FilterList, containerURL: URL) {
+    /// Call under the publication lock so the identities describe this download.
+    static func record(normalizedDigest: String, for filter: FilterList, containerURL: URL, includeSource: URL?) {
         let fileURL = savedFileURL(for: filter, containerURL: containerURL)
         guard let saved = identity(of: fileURL) else { return }
-        let digest = DigestSupport.sha256Hex(FilterListContentProcessing.normalizedContent(from: String(decoding: body, as: UTF8.self)))
-        try? "\(digest)|\(saved)".write(to: sidecarURL(for: filter, containerURL: containerURL), atomically: true, encoding: .utf8)
+        let baseline = includeSource.flatMap { _ in
+            identity(of: FilterListFetchChain.diffBaselineURL(for: filter, containerURL: containerURL))
+        }
+        let state = State(
+            digest: normalizedDigest, sourceIdentity: saved, includeSource: includeSource, baselineIdentity: baseline
+        )
+        if let data = try? JSONEncoder().encode(state) {
+            try? FilterArtifactStorage.write(data, to: sidecarURL(for: filter, containerURL: containerURL))
+        }
     }
 
     /// The recorded digest, or nil when the saved file has changed since it was recorded.
     public static func load(for filter: FilterList, containerURL: URL) -> String? {
-        let fileURL = savedFileURL(for: filter, containerURL: containerURL)
-        guard let text = try? String(contentsOf: sidecarURL(for: filter, containerURL: containerURL), encoding: .utf8),
-              let separator = text.firstIndex(of: "|"),
-              let saved = identity(of: fileURL),
-              text[text.index(after: separator)...] == saved
+        state(for: filter, containerURL: containerURL)?.digest
+    }
+
+    static func state(for filter: FilterList, containerURL: URL) -> State? {
+        guard let data = try? Data(contentsOf: sidecarURL(for: filter, containerURL: containerURL)),
+              let state = try? JSONDecoder().decode(State.self, from: data),
+              state.sourceIdentity == identity(of: savedFileURL(for: filter, containerURL: containerURL))
         else { return nil }
-        return String(text[..<separator])
+        return state
+    }
+
+    static func cachedParent(for filter: FilterList, containerURL: URL, state: State) -> Data? {
+        let url = FilterListFetchChain.diffBaselineURL(for: filter, containerURL: containerURL)
+        guard let baselineIdentity = state.baselineIdentity, baselineIdentity == identity(of: url),
+              let data = try? Data(contentsOf: url), baselineIdentity == identity(of: url),
+              state.sourceIdentity == identity(of: savedFileURL(for: filter, containerURL: containerURL))
+        else { return nil }
+        return data
     }
 }

@@ -65,7 +65,11 @@ public actor FilterPreprocessor {
     ///             Used both as the origin for same-origin checks and as the self-cycle guard.
     /// - Returns: Fully expanded filter list content, ready for SafariConverterLib.
     public func preprocess(content: String, listURL: URL) async -> String {
-        if Self.canPassThroughUnchanged(content) { return content }
+        await preprocessWithChangeFlag(content: content, listURL: listURL).content
+    }
+
+    func preprocessWithChangeFlag(content: String, listURL: URL) async -> (content: String, modified: Bool, hasIncludes: Bool) {
+        if Self.canPassThroughUnchanged(content) { return (content, false, false) }
 
         // Step 1: Split into lines
         let lines = content.components(separatedBy: .newlines)
@@ -87,7 +91,7 @@ public actor FilterPreprocessor {
 
         // Step 5: Expand all !#include directives recursively.
         // Depth starts at 0; IncludeResolver increments on each level of recursion.
-        let expanded = await resolver.expandIncludes(
+        let expanded = await resolver.expandIncludesTrackingDependencies(
             in: evaluated,
             baseURL: baseURL,
             visited: visited,
@@ -95,7 +99,11 @@ public actor FilterPreprocessor {
         )
 
         // Step 6: Join and return as a single string for SafariConverterLib.
-        return expanded.joined(separator: "\n")
+        return (expanded.lines.joined(separator: "\n"), true, expanded.hasIncludes)
+    }
+
+    static func mayContainIncludes(_ data: Data) -> Bool {
+        data.range(of: Data("!#include".utf8)) != nil || data.range(of: Data("%include ".utf8)) != nil
     }
 
     /// A plain LF list within the expansion limits needs no line arrays.

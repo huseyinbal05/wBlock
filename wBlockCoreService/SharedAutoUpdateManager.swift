@@ -2149,13 +2149,12 @@ public actor SharedAutoUpdateManager {
         let etag = await getFilterEtag(uuid)
         let lastModified = await getFilterLastModified(uuid)
         do {
-            let result = try await FilterListFetchChain.fetch(
-                session: urlSession, primaryURL: filter.url,
-                fallbackURLs: FilterListURLMirror.fallbackURLs(for: filter.url),
+            let result = try await FilterListFetchChain.fetchUpdate(
+                for: filter, containerURL: containerURL, session: urlSession,
                 etag: etag, lastModified: lastModified, timeout: timeout,
-                diffBaselineURL: FilterListFetchChain.diffBaselineURL(for: filter, containerURL: containerURL),
                 patches: patches, hedgedFallback: hedgedFallback,
-                log: { await self.appendSharedLog("Diff update: \(filter.name) \($0)") })
+                log: { await self.appendSharedLog("Diff update: \(filter.name) \($0)") }
+            )
             let data = result.data
             let http = result.response
             let responseEtag = result.servedFallback ? nil : http.value(forHTTPHeaderField: "ETag")
@@ -2165,23 +2164,26 @@ public actor SharedAutoUpdateManager {
             if result.servedFallback {
                 await ProtobufDataManager.shared.setFilterValidators(uuid, etag: nil, lastModified: nil)
             }
-            let responseStatus = FilterUpdateResponseClassifier.classify(
-                statusCode: http.statusCode, responseData: data,
-                localData: self.localDataForComparison(filter: filter, containerURL: containerURL),
-                usedFallbackMirror: result.servedFallback,
-                localNormalizedDigest: FilterListNormalizedDigest.load(for: filter, containerURL: containerURL))
+            let unchanged: FilterFetchOutcome = hasValidatorUpdates
+                ? .noChangeWithValidators(uuid: uuid, etag: responseEtag, lastModified: responseLastModified)
+                : .noChange(uuid: uuid)
+            let responseStatus: FilterUpdateResponseStatus
+            if result.requiresExpandedComparison, http.statusCode == 200 {
+                responseStatus = FilterUpdateResponseClassifier.looksLikeFilterListData(data) ? .updatedContent : .invalidContent
+            } else {
+                responseStatus = FilterUpdateResponseClassifier.classify(
+                    statusCode: http.statusCode, responseData: data,
+                    localData: self.localDataForComparison(filter: filter, containerURL: containerURL),
+                    usedFallbackMirror: result.servedFallback,
+                    localNormalizedDigest: FilterListNormalizedDigest.load(for: filter, containerURL: containerURL)
+                )
+            }
 
             switch responseStatus {
             case .notModified:
                 return .noChange(uuid: uuid)
             case .unchangedContent:
-                return hasValidatorUpdates
-                    ? .noChangeWithValidators(
-                        uuid: uuid,
-                        etag: responseEtag,
-                        lastModified: responseLastModified
-                    )
-                    : .noChange(uuid: uuid)
+                return unchanged
             case .invalidContent:
                 // Don't overwrite the on-disk list with HTML challenge pages or other garbage.
                 return .error(filterName: filter.name, error: URLError(.cannotParseResponse))
@@ -2191,27 +2193,34 @@ public actor SharedAutoUpdateManager {
                 break
             }
 
-            // Expanding !#include reads sub-lists over the network, which the extension does not do.
-            if deferIncludeExpansion, data.range(of: Data("!#include".utf8)) != nil {
+            // The extension leaves sub-list network requests to the app.
+            if deferIncludeExpansion, !filter.isOptimizedBuiltin, FilterPreprocessor.mayContainIncludes(data) {
                 return .deferredToApp
             }
 
-            let processed = try await FilterDownloadProcessor.processAndPublish(
-                data: data,
-                sourceURL: result.sourceURL,
-                filter: filter,
-                containerURL: containerURL,
-                etag: responseEtag,
-                lastModified: responseLastModified,
-                urlSession: urlSession,
-                onIncludeFetchError: { subURL, statusCode in
-                    let statusStr = statusCode.map { "\($0)" } ?? "network error"
-                    await self.appendSharedLog(
-                        "!#include fetch failed: filter=\(filter.name), subURL=\(subURL.absoluteString), status=\(statusStr)"
-                    )
-                }
-            )
-            FilterListNormalizedDigest.record(body: data, for: filter, containerURL: containerURL)
+            let onIncludeFetchError: IncludeResolver.FetchErrorHandler = { subURL, statusCode in
+                let status = statusCode.map(String.init) ?? "network error"
+                await self.appendSharedLog(
+                    "!#include fetch failed: filter=\(filter.name), subURL=\(subURL.absoluteString), status=\(status)"
+                )
+            }
+            let processed: (filter: FilterList, strippedDirectives: [String])
+            if result.requiresExpandedComparison {
+                guard let prepared = try await FilterDownloadProcessor.prepareChangedSource(
+                    data: data, sourceURL: result.sourceURL, usedFallbackMirror: result.servedFallback,
+                    filter: filter, containerURL: containerURL, urlSession: urlSession,
+                    onIncludeFetchError: onIncludeFetchError
+                ) else { return unchanged }
+                processed = try FilterDownloadProcessor.publish(
+                    prepared, containerURL: containerURL, etag: responseEtag, lastModified: responseLastModified
+                )
+            } else {
+                processed = try await FilterDownloadProcessor.processAndPublish(
+                    data: data, sourceURL: result.sourceURL, filter: filter, containerURL: containerURL,
+                    etag: responseEtag, lastModified: responseLastModified, urlSession: urlSession,
+                    onIncludeFetchError: onIncludeFetchError
+                )
+            }
             if !processed.strippedDirectives.isEmpty {
                 appendSharedLog(
                     "Stripped unknown directives: filter=\(filter.name), directives=\(processed.strippedDirectives.joined(separator: ", "))"

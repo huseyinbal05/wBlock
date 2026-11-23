@@ -126,10 +126,8 @@ public enum PendingFilterUpdateRevisions {
             sourceFilename: sourceFilename,
             stagedFilename: stagedFilename
         )
-        lock.lock()
-        defer { lock.unlock() }
         do {
-            try withFileLock(for: storeURL) {
+            try withPublicationLock(for: storeURL) {
                 let previous = loadStateUnlocked(from: storeURL)
                 var next = previous
                 next.revisionsByFilterID[filterID] = revision
@@ -146,6 +144,12 @@ public enum PendingFilterUpdateRevisions {
         } catch {
             return nil
         }
+    }
+
+    static func withPublicationLock<T>(for storeURL: URL, _ body: () throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try withFileLock(for: storeURL, body)
     }
 
     public static func contains(

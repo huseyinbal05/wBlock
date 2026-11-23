@@ -21,7 +21,14 @@ public enum DigestSupport {
     }
 
     public static func sha256Hex(_ string: String) -> String {
-        sha256Hex(Data(string.utf8))
+        var copy = string
+        copy.makeContiguousUTF8()
+        let digest = copy.utf8.withContiguousStorageIfAvailable { bytes in
+            var hasher = SHA256()
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(bytes))
+            return hasher.finalize()
+        } ?? SHA256.hash(data: Data(copy.utf8))
+        return hex(digest)
     }
 }
 
