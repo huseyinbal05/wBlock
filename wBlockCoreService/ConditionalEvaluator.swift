@@ -36,62 +36,121 @@ public enum ConditionalEvaluator {
     /// - Returns: Lines with conditional blocks resolved; all directive lines removed.
     ///            Non-directive lines are preserved verbatim (not trimmed or modified).
     public static func evaluate(lines: [String]) -> [String] {
-        resolveConditions(lines)
+        resolveConditions(lines[...])
     }
 
     // MARK: - Block processor
 
-    private static func resolveConditions(_ lines: [String]) -> [String] {
+    static func trimmedDirectiveLine(_ line: String) -> Substring {
+        let utf8 = line.utf8
+        var start = utf8.startIndex
+        var end = utf8.endIndex
+        while start < end {
+            let b = utf8[start]
+            if b == UInt8(ascii: " ") || b == UInt8(ascii: "\t") || (b >= 0x0A && b <= 0x0D) {
+                utf8.formIndex(after: &start)
+            } else {
+                break
+            }
+        }
+        while end > start {
+            let before = utf8.index(before: end)
+            let b = utf8[before]
+            if b == UInt8(ascii: " ") || b == UInt8(ascii: "\t") || (b >= 0x0A && b <= 0x0D) {
+                end = before
+            } else {
+                break
+            }
+        }
+        if start < end, utf8[start] >= 0x80 || utf8[utf8.index(before: end)] >= 0x80 {
+            return line[start..<end].trimmingCharacters(in: .whitespacesAndNewlines)[...]
+        }
+        return line[start..<end]
+    }
+
+    /// Fast prefix check used by `FilterPreprocessor`'s pass-through scan so all
+    /// conditional directive syntax stays owned by `ConditionalEvaluator`.
+    static func startsWithDirective(_ bytes: UnsafeBufferPointer<UInt8>, at index: Int) -> Bool {
+        guard index + 1 < bytes.count,
+              bytes[index] == UInt8(ascii: "!"),
+              bytes[index + 1] == UInt8(ascii: "#")
+        else { return false }
+        let afterIntro = index + 2
+        if matchesBytes(bytes, at: afterIntro, "if") {
+            let afterIf = afterIntro + 2
+            return afterIf == bytes.count
+                || bytes[afterIf] == UInt8(ascii: " ")
+                || bytes[afterIf] == UInt8(ascii: "\t")
+                || bytes[afterIf] == UInt8(ascii: "\n")
+        }
+        return matchesBytes(bytes, at: afterIntro, "else")
+            || matchesBytes(bytes, at: afterIntro, "endif")
+    }
+
+    static func matchesBytes(_ bytes: UnsafeBufferPointer<UInt8>, at index: Int, _ target: StaticString) -> Bool {
+        let len = target.utf8CodeUnitCount
+        guard index + len <= bytes.count else { return false }
+        let targetPtr = target.utf8Start
+        for offset in 0..<len where bytes[index + offset] != targetPtr[offset] {
+            return false
+        }
+        return true
+    }
+
+    private static func resolveConditions(_ lines: ArraySlice<String>) -> [String] {
         var result: [String] = []
-        var i = 0
+        result.reserveCapacity(lines.count)
+        var i = lines.startIndex
+        let end = lines.endIndex
 
-        while i < lines.count {
-            let trimmed = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+        while i < end {
+            let trimmed = trimmedDirectiveLine(lines[i])
 
-            if trimmed == "!#if" || trimmed.hasPrefix("!#if ") {
-                // Find the matching !#endif (respects nesting)
-                let endIndex = findBlockEnd(
-                    lines: lines,
-                    seeking: "!#endif",
-                    from: i + 1,
-                    to: lines.count
-                )
+            if trimmed.utf8.first == UInt8(ascii: "!") {
+                if trimmed == "!#if" || trimmed.hasPrefix("!#if ") {
+                    let blockStart = lines.index(after: i)
+                    let endIndex = findBlockEnd(
+                        lines: lines,
+                        seeking: "!#endif",
+                        from: blockStart,
+                        to: end
+                    )
 
-                guard endIndex != -1 else {
-                    // Unmatched !#if — skip the directive, continue
-                    i += 1
+                    guard endIndex != -1 else {
+                        // Unmatched !#if — skip the directive, continue
+                        i = blockStart
+                        continue
+                    }
+
+                    // Find a same-level !#else within this block (if any)
+                    let elseIndex = findBlockEnd(
+                        lines: lines,
+                        seeking: "!#else",
+                        from: blockStart,
+                        to: endIndex
+                    )
+
+                    if evaluateCondition(trimmed) {
+                        let trueEnd = elseIndex == -1 ? endIndex : elseIndex
+                        result += resolveConditions(lines[blockStart..<trueEnd])
+                    } else if elseIndex != -1 {
+                        let falseStart = lines.index(after: elseIndex)
+                        result += resolveConditions(lines[falseStart..<endIndex])
+                    }
+                    // Skip past the entire block (including the !#endif line)
+                    i = lines.index(after: endIndex)
+                    continue
+
+                } else if trimmed.hasPrefix("!#else") || trimmed.hasPrefix("!#endif") {
+                    // Orphaned directive — skip silently
+                    i = lines.index(after: i)
                     continue
                 }
-
-                // Find a same-level !#else within this block (if any)
-                let elseIndex = findBlockEnd(
-                    lines: lines,
-                    seeking: "!#else",
-                    from: i + 1,
-                    to: endIndex
-                )
-
-                let conditionMet = evaluateCondition(trimmed)
-
-                if conditionMet {
-                    let trueSlice = Array(lines[(i + 1)..<(elseIndex == -1 ? endIndex : elseIndex)])
-                    result += resolveConditions(trueSlice)
-                } else if elseIndex != -1 {
-                    let falseSlice = Array(lines[(elseIndex + 1)..<endIndex])
-                    result += resolveConditions(falseSlice)
-                }
-                // Skip past the entire block (including the !#endif line)
-                i = endIndex + 1
-
-            } else if trimmed.hasPrefix("!#else") || trimmed.hasPrefix("!#endif") {
-                // Orphaned directive — skip silently
-                i += 1
-
-            } else {
-                // Non-directive line — preserve verbatim (never trim)
-                result.append(lines[i])
-                i += 1
             }
+
+            // Non-directive line — preserve verbatim (never trim)
+            result.append(lines[i])
+            i = lines.index(after: i)
         }
 
         return result
@@ -106,7 +165,7 @@ public enum ConditionalEvaluator {
     /// what target we're seeking). Return when `depth == 0` AND line matches `target`.
     /// This correctly skips over nested `!#if...!#endif` pairs when searching for `!#else`.
     private static func findBlockEnd(
-        lines: [String],
+        lines: ArraySlice<String>,
         seeking target: String,
         from start: Int,
         to end: Int
@@ -114,7 +173,8 @@ public enum ConditionalEvaluator {
         var depth = 0
 
         for i in start..<end {
-            let trimmed = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = trimmedDirectiveLine(lines[i])
+            guard trimmed.utf8.first == UInt8(ascii: "!") else { continue }
 
             if trimmed == "!#if" || trimmed.hasPrefix("!#if ") {
                 depth += 1
@@ -137,7 +197,7 @@ public enum ConditionalEvaluator {
     // MARK: - Expression evaluator
 
     /// Strips the `!#if ` prefix and delegates to `evaluateExpression(_:)`.
-    private static func evaluateCondition(_ ifLine: String) -> Bool {
+    private static func evaluateCondition(_ ifLine: Substring) -> Bool {
         let prefix = "!#if "
         guard ifLine.hasPrefix(prefix) else { return false }
         let expression = String(ifLine.dropFirst(prefix.count))

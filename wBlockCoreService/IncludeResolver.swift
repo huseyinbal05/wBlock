@@ -155,10 +155,10 @@ public actor IncludeResolver {
 
         for line in lines {
             guard result.count < maximumLines, resultBytes < maximumBytes else { break }
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = ConditionalEvaluator.trimmedDirectiveLine(line)
             if Self.includePath(from: trimmed) != nil {
                 let expanded = await resolve(
-                    includeLine: trimmed,
+                    includeLine: String(trimmed),
                     baseURL: baseURL,
                     visited: visited,
                     depth: depth,
@@ -247,10 +247,23 @@ public actor IncludeResolver {
     /// EasyList template aliases such as `%include easylist:foo.txt%` name a
     /// repository the list does not point at, so they are not includes we can fetch.
     public static func includePath(from line: String) -> String? {
-        if line.hasPrefix("!#include") {
+        includePath(from: line[...])
+    }
+
+    /// Fast prefix check used by `FilterPreprocessor`'s pass-through scan so all
+    /// include directive syntax stays owned by `IncludeResolver`.
+    static func startsWithDirective(_ bytes: UnsafeBufferPointer<UInt8>, at index: Int) -> Bool {
+        ConditionalEvaluator.matchesBytes(bytes, at: index, "!#include")
+            || ConditionalEvaluator.matchesBytes(bytes, at: index, "%include ")
+    }
+
+    static func includePath(from line: Substring) -> String? {
+        let utf8 = line.utf8
+        guard let first = utf8.first else { return nil }
+        if first == UInt8(ascii: "!"), line.hasPrefix("!#include") {
             return String(line.dropFirst("!#include".count)).trimmingCharacters(in: .whitespaces)
         }
-        guard line.hasPrefix("%include "), line.hasSuffix("%") else { return nil }
+        guard first == UInt8(ascii: "%"), line.hasPrefix("%include "), line.hasSuffix("%") else { return nil }
         let path = line.dropFirst("%include ".count).dropLast().trimmingCharacters(in: .whitespaces)
         guard !path.contains(":") || path.hasPrefix("https://") else { return nil }
         return path

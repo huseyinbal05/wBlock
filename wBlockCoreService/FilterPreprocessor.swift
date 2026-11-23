@@ -65,6 +65,14 @@ public actor FilterPreprocessor {
     ///             Used both as the origin for same-origin checks and as the self-cycle guard.
     /// - Returns: Fully expanded filter list content, ready for SafariConverterLib.
     public func preprocess(content: String, listURL: URL) async -> String {
+        await preprocessWithChangeFlag(content: content, listURL: listURL).content
+    }
+
+    func preprocessWithChangeFlag(content: String, listURL: URL) async -> (content: String, modified: Bool) {
+        if Self.canPassThroughUnchanged(content) {
+            return (content, false)
+        }
+
         // Step 1: Split into lines
         let lines = content.components(separatedBy: .newlines)
 
@@ -93,6 +101,56 @@ public actor FilterPreprocessor {
         )
 
         // Step 6: Join and return as a single string for SafariConverterLib.
-        return expanded.joined(separator: "\n")
+        return (expanded.joined(separator: "\n"), true)
+    }
+
+    /// Returns true only when `content` has LF-only line breaks, stays within line/byte
+    /// expansion limits, and contains no conditional or include directives
+    /// so preprocessing would return the exact same string unchanged.
+    private static func canPassThroughUnchanged(_ content: String) -> Bool {
+        guard content.utf8.count < IncludeResolver.maxExpandedBytes else { return false }
+        var copy = content
+        copy.makeContiguousUTF8()
+        return copy.utf8.withContiguousStorageIfAvailable { bytes -> Bool in
+            let count = bytes.count
+            var lfCount = 0
+            var i = 0
+            var atLineStart = true
+
+            while i < count {
+                let b = bytes[i]
+                if atLineStart {
+                    if b == UInt8(ascii: " ") || b == UInt8(ascii: "\t") {
+                        i += 1
+                        continue
+                    }
+                    if b >= 0x80 {
+                        return false
+                    }
+                    atLineStart = false
+                    if b == UInt8(ascii: "!") || b == UInt8(ascii: "%") {
+                        if ConditionalEvaluator.startsWithDirective(bytes, at: i)
+                            || IncludeResolver.startsWithDirective(bytes, at: i)
+                        {
+                            return false
+                        }
+                    }
+                }
+                if b == UInt8(ascii: "\n") {
+                    lfCount += 1
+                    if lfCount >= IncludeResolver.maxExpandedLines { return false }
+                    atLineStart = true
+                } else if b >= 0x0B && b <= 0x0D {
+                    return false
+                } else if b == 0xC2, i + 1 < count, bytes[i + 1] == 0x85 {
+                    return false
+                } else if b == 0xE2, i + 2 < count, bytes[i + 1] == 0x80,
+                          bytes[i + 2] == 0xA8 || bytes[i + 2] == 0xA9 {
+                    return false
+                }
+                i += 1
+            }
+            return true
+        } ?? false
     }
 }
