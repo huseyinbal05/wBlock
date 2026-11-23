@@ -13,6 +13,7 @@
 // Prints `PASS` on success, `FAIL: <message>` (exit 1) on the first divergence.
 //
 
+import CryptoKit
 import Foundation
 
 @main
@@ -29,6 +30,9 @@ struct FilterDiffUpdaterTests {
         testChecksumMismatch()
         testChecksumValidation()
         testMalformedPatchFails()
+        testStreamingMultiHunkLargeDiff()
+        testCRLFAndEmptyBaseline()
+        testOutOfOrderFallbackAndInvalidCommands()
 
         print("PASS")
     }
@@ -275,6 +279,117 @@ struct FilterDiffUpdaterTests {
             break // expected
         default:
             fail("expected badPatch for an unparseable RCS command")
+        }
+    }
+
+    private static func naiveApplyRCSDiff(_ rcsDiff: String, to baseline: String) -> String? {
+        var lines = baseline.components(separatedBy: "\n")
+        let diffLines = rcsDiff.components(separatedBy: "\n")
+        var diffIndex = 0
+        var adjust = 0
+        while diffIndex < diffLines.count {
+            let line = diffLines[diffIndex]
+            diffIndex += 1
+            if line.isEmpty { break }
+            let parts = line.dropFirst().split(separator: " ")
+            guard let first = line.first, parts.count == 2,
+                  let n = Int(parts[0]), let c = Int(parts[1])
+            else { return nil }
+            let adjusted = n + adjust
+            if first == "d" {
+                guard adjusted >= 1, adjusted <= lines.count else { return nil }
+                let start = adjusted - 1
+                let rem = min(c, lines.count - start)
+                if rem > 0 { lines.removeSubrange(start..<(start + rem)) }
+                adjust -= c
+            } else if first == "a" {
+                guard adjusted >= 0, adjusted <= lines.count, diffIndex + c <= diffLines.count else { return nil }
+                lines.insert(contentsOf: diffLines[diffIndex..<(diffIndex + c)], at: adjusted)
+                diffIndex += c
+                adjust += c
+            } else {
+                return nil
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func testStreamingMultiHunkLargeDiff() {
+        let baseArray = (1...10_000).map { "||rule-\($0).example^" }
+        let baseline = baseArray.joined(separator: "\n") + "\n"
+
+        let diff = """
+        d5 3
+        a7 2
+        ||inserted-a.example^
+        ||inserted-b.example^
+        d2500 1
+        a6000 2
+        ||mid-a.example^
+        ||mid-b.example^
+        d8000 500
+        a10000 1
+        ||tail.example^
+        """
+
+        let expected = unwrap(naiveApplyRCSDiff(diff, to: baseline), "naive reference apply should succeed")
+        let patched = unwrap(FilterDiffUpdater.applyRCSDiff(diff, to: baseline), "multi-hunk large diff should apply")
+        expectEqual(patched, expected, "streaming RCS diff must match naive array apply")
+
+        let sha = Insecure.SHA1.hash(data: Data(expected.utf8)).map { String(format: "%02x", $0) }.joined()
+        let block = FilterDiffPatchBlock(name: "large", checksum: String(sha.prefix(10)), diffText: diff)
+        switch FilterDiffUpdater.applyBlock(block, to: baseline) {
+        case .success(let output):
+            expectEqual(output, expected, "applyBlock large diff checksum and output")
+        default:
+            fail("applyBlock should succeed on valid multi-hunk large diff")
+        }
+    }
+
+    static func testCRLFAndEmptyBaseline() {
+        let crlfBaseline = "a\r\nb\r\nc\r\n"
+        let crlfDiff = "d2 1\na2 1\nX\r"
+        expectEqual(
+            FilterDiffUpdater.applyRCSDiff(crlfDiff, to: crlfBaseline),
+            "a\r\nX\r\nc\r\n",
+            "applyRCSDiff splits strictly on LF and preserves CR"
+        )
+
+        expectEqual(
+            FilterDiffUpdater.applyRCSDiff("a0 1\nfirst", to: ""),
+            "first\n",
+            "append at 0 on empty baseline preserves trailing sentinel"
+        )
+
+        expectEqual(
+            FilterDiffUpdater.applyRCSDiff("d3 10", to: "1\n2\n3"),
+            "1\n2",
+            "clamped delete near EOF deletes through end of baseline"
+        )
+    }
+
+    static func testOutOfOrderFallbackAndInvalidCommands() {
+        let baseline = "1\n2\n3\n4\n5"
+        // Deleting line 4 first advances streaming cursor past line 1 (adjust = -1).
+        // `d2 1` then adjusts to line 1 (index 0), hitting backward fallback -> "2\n3\n5".
+        expectEqual(
+            FilterDiffUpdater.applyRCSDiff("d4 1\nd2 1", to: baseline),
+            "2\n3\n5",
+            "out-of-order backward delete falls back cleanly"
+        )
+
+        for badDiff in [
+            "d0 1",
+            "d99 1",
+            "a99 1\nx",
+            "d99999999999999999999999 1",
+            "a1 999999999999999999999999\nx",
+            "a1 2\nonly-one-line",
+        ] {
+            expect(
+                FilterDiffUpdater.applyRCSDiff(badDiff, to: baseline) == nil,
+                "invalid diff command must return nil: \(badDiff)"
+            )
         }
     }
 }
