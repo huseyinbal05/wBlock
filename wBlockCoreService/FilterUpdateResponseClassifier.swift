@@ -95,11 +95,23 @@ public enum FilterUpdateResponseClassifier {
            UserScript.isVersionNewer(localVersion, than: remoteVersion) {
             return false
         }
-        let normalized = Data(FilterListContentProcessing.normalizedContent(from: remoteText).utf8)
+        var normalizedText = FilterListContentProcessing.normalizedContent(from: remoteText)
         if let localNormalizedDigest {
-            return sha256Hex(normalized) != localNormalizedDigest
+            return DigestSupport.sha256Hex(normalizedText) != localNormalizedDigest
         }
-        return normalized != localData
+        normalizedText.makeContiguousUTF8()
+        if let equal = normalizedText.utf8.withContiguousStorageIfAvailable({ remoteBytes in
+            guard remoteBytes.count == localData.count else { return false }
+            return localData.withUnsafeBytes { localBytes in
+                guard let remoteBase = remoteBytes.baseAddress, let localBase = localBytes.baseAddress else {
+                    return remoteBytes.isEmpty && localData.isEmpty
+                }
+                return memcmp(remoteBase, localBase, remoteBytes.count) == 0
+            }
+        }) {
+            return !equal
+        }
+        return !normalizedText.utf8.elementsEqual(localData)
     }
 
     /// Only dotted numbers order reliably; some lists stamp a date instead.
