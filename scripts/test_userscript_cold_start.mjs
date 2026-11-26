@@ -5,16 +5,31 @@
 // on its way.
 //
 // Run: node scripts/test_userscript_cold_start.mjs [path/to/userscript-injector.js]
+// Defaults to testing both extension-src/userscript-injector.js and
+// "wBlock Scripts (iOS)/Resources/userscript-injector.js".
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const source = readFileSync(process.argv[2]
-  ?? path.join(repoRoot, "wBlock Scripts (iOS)", "Resources", "userscript-injector.js"), "utf8");
+const selfPath = fileURLToPath(import.meta.url);
+const repoRoot = path.join(path.dirname(selfPath), "..");
+if (!process.argv[2]) {
+  for (const relTarget of [
+    ["extension-src", "userscript-injector.js"],
+    ["wBlock Scripts (iOS)", "Resources", "userscript-injector.js"],
+  ]) {
+    const targetPath = path.join(repoRoot, ...relTarget);
+    console.log(`\n=== Running cold-start checks against ${relTarget.join("/")} ===`);
+    execFileSync(process.execPath, [selfPath, targetPath], { stdio: "inherit" });
+  }
+  process.exit(0);
+}
+
+const source = readFileSync(process.argv[2], "utf8");
 
 let failures = 0;
 const check = (name, condition) => {

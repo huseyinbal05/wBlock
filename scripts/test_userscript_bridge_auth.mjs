@@ -4,17 +4,31 @@
 // Genuine native stream messages never pass through window.postMessage.
 //
 // Run: node scripts/test_userscript_bridge_auth.mjs [path/to/userscript-injector.js]
-// Defaults to "wBlock Scripts (iOS)/Resources/userscript-injector.js".
+// Defaults to testing both extension-src/userscript-injector.js and
+// "wBlock Scripts (iOS)/Resources/userscript-injector.js".
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const injectorPath = process.argv[2]
-  ?? path.join(repoRoot, "wBlock Scripts (iOS)", "Resources", "userscript-injector.js");
+const selfPath = fileURLToPath(import.meta.url);
+const repoRoot = path.join(path.dirname(selfPath), "..");
+if (!process.argv[2]) {
+  for (const relTarget of [
+    ["extension-src", "userscript-injector.js"],
+    ["wBlock Scripts (iOS)", "Resources", "userscript-injector.js"],
+  ]) {
+    const targetPath = path.join(repoRoot, ...relTarget);
+    console.log(`\n=== Running bridge auth checks against ${relTarget.join("/")} ===`);
+    execFileSync(process.execPath, [selfPath, targetPath], { stdio: "inherit" });
+  }
+  process.exit(0);
+}
+
+const injectorPath = process.argv[2];
 const source = readFileSync(injectorPath, "utf8");
 const cacheRevision = (source.match(/WBLOCK_BUNDLED_USERSCRIPT_CACHE_REVISION = ['\"]([^'\"]+)/) || [])[1] || "";
 
@@ -1246,12 +1260,14 @@ for (const kind of ['script', 'style']) {
 {
   const probe = buildContentScriptSandbox(null, []);
   probe.__wblockFrameInitialization = Promise.resolve({userScripts:[fakeScript]});
-  vm.createContext(probe); vm.runInContext(source.replace("new UserScriptEngine();", "globalThis.__engine = new UserScriptEngine();"), probe);
+  vm.createContext(probe); vm.runInContext(source, probe);
   await tick(); await tick();
   check('combined startup avoids a separate userscript lookup', !probe.__sentMessages.some(m => m.action === 'getUserScripts'));
   check('combined startup retains native execution validation', probe.__sentMessages.some(m => m.action === 'validateUserScriptExecutions'));
   check('combined startup is consumed only once', !probe.__wblockFrameInitialization);
-  vm.runInContext("__engine.invalidateDocumentStartSessionCache()", probe);
+  for (const listener of probe.__runtimeListeners) {
+    listener({ type: 'wblock:clearDocumentStartSessionCache' }, {}, () => {});
+  }
   await tick();
   check('invalidation requests fresh userscripts after combined startup', probe.__sentMessages.some(m => m.action === 'getUserScripts'));
 }

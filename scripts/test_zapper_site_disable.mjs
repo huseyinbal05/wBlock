@@ -4,15 +4,30 @@
 // - migrates the legacy local-only disabled key to native exactly once
 //
 // Run: node scripts/test_zapper_site_disable.mjs [path/to/zapper-content.js]
+// Defaults to testing both extension-src/zapper-content.js and
+// "wBlock Scripts (iOS)/Resources/zapper-content.js".
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const scriptPath = process.argv[2]
-  ?? path.join(repoRoot, "wBlock Scripts (iOS)", "Resources", "zapper-content.js");
+const selfPath = fileURLToPath(import.meta.url);
+const repoRoot = path.join(path.dirname(selfPath), "..");
+if (!process.argv[2]) {
+  for (const relTarget of [
+    ["extension-src", "zapper-content.js"],
+    ["wBlock Scripts (iOS)", "Resources", "zapper-content.js"],
+  ]) {
+    const targetPath = path.join(repoRoot, ...relTarget);
+    console.log(`\n=== Running zapper site-disable checks against ${relTarget.join("/")} ===`);
+    execFileSync(process.execPath, [selfPath, targetPath], { stdio: "inherit" });
+  }
+  process.exit(0);
+}
+
+const scriptPath = process.argv[2];
 const source = readFileSync(scriptPath, "utf8");
 
 let failures = 0;

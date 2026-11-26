@@ -1,0 +1,1423 @@
+// wBlock Element Zapper (WebExtension content script)
+//
+// - Persists per-site CSS selectors in browser.storage.local
+// - Applies saved selectors on every page load
+// - Provides an in-page picker UI when activated from the extension popup
+
+(function () {
+  'use strict';
+
+  if (typeof browser === 'undefined' || !browser.runtime || !browser.runtime.sendMessage || !browser.runtime.onMessage) {
+    return;
+  }
+
+  // One copy per document. A second copy would build its own panel and its
+  // own click interceptor, which swallows clicks meant for the first panel.
+  if (window.__wblockZapperLoaded) return;
+  window.__wblockZapperLoaded = true;
+
+  const STORAGE_PREFIX = 'wblock.zapperRules.v1:';
+  const META_PREFIX = 'wblock.zapperMeta.v1:';
+  const STYLE_ID = 'wblock-zapper-style';
+  const UI_ROOT_ID = 'wblock-zapper-root';
+  const HIGHLIGHT_ID = 'wblock-zapper-highlight';
+  const TOAST_ID = 'wblock-zapper-toast';
+  const TEMP_STYLE_ID = 'wblock-zapper-temp-style';
+  const MAX_RULES_PER_SITE = 200;
+  // Native state changes are pushed through the background port. Keep only a
+  // coarse top-frame fallback for Safari sessions where that port is lost.
+  const RULE_SYNC_FALLBACK_INTERVAL_MS = 5 * 60 * 1000;
+  const NATIVE_MESSAGE_TIMEOUT_MS = 3500;
+
+  function t(key, substitutions, fallback = '') {
+    const message = browser.i18n.getMessage(key, substitutions);
+    if (typeof message === 'string' && message.length > 0) {
+      return message;
+    }
+    return fallback;
+  }
+
+  function withTimeout(promise, timeoutMs, message = 'Operation timed out.') {
+    let timer = null;
+    return Promise.race([
+      Promise.resolve(promise).finally(() => {
+        if (timer !== null) clearTimeout(timer);
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  }
+
+  const state = {
+    active: false,
+    host: '',
+    rules: [],
+    inheritedRules: [],
+    tempRules: [],
+    undoStack: [],
+    redoStack: [],
+    lastPickAt: 0,
+    pressPicked: false,
+    candidateElement: null,
+    traversalPath: [],
+    cleanupFns: [],
+    ui: {
+      root: null,
+      host: null,
+      shadow: null,
+      highlight: null,
+      toast: null,
+      undoButton: null,
+      redoButton: null,
+      addRuleButton: null,
+      parentButton: null,
+      childButton: null,
+      hideOnceButton: null,
+    },
+    rulesDisabled: false,
+    // The global Element Zapper pause, kept apart from this site's switch.
+    zapperPaused: false,
+  };
+
+  let ruleSyncIntervalId = null;
+  let ruleSyncInFlight = false;
+  let ruleReloadPromise = null;
+  let ruleReloadPending = false;
+  let ruleReloadActive = false;
+  let isFinalizingSession = false;
+  const pendingSaveOperations = new Set();
+
+  function trackPendingSave(operationPromise) {
+    let trackedPromise;
+    trackedPromise = Promise.resolve(operationPromise)
+      .catch(() => {})
+      .finally(() => {
+        pendingSaveOperations.delete(trackedPromise);
+      });
+    pendingSaveOperations.add(trackedPromise);
+    return trackedPromise;
+  }
+
+  async function waitForPendingSaves(timeoutMs = 1500) {
+    if (pendingSaveOperations.size === 0) return;
+    const pending = Array.from(pendingSaveOperations);
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs))
+    ]);
+  }
+
+  async function finalizeSession() {
+    if (isFinalizingSession) return;
+    isFinalizingSession = true;
+
+    try {
+      await waitForPendingSaves();
+      // Delay teardown until after the current input/click sequence completes
+      // so we don't accidentally retarget the synthetic click to the page.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // The hide stylesheet stays in place, so no page reload is needed;
+      // the native content blocker rules take over on the next navigation.
+      deactivateZapper({ removeUi: true });
+    } catch {
+      deactivateZapper({ removeUi: true });
+    } finally {
+      isFinalizingSession = false;
+    }
+  }
+
+  function safeHostname() {
+    try {
+      return typeof location !== 'undefined' ? (location.hostname || '') : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function storageKey(host) {
+    return `${STORAGE_PREFIX}${host}`;
+  }
+
+  function metaKey(host) {
+    return `${META_PREFIX}${host}`;
+  }
+
+  async function setSiteZapperDisabled(host, disabled) {
+    if (!host) return null;
+    try {
+      return await withTimeout(browser.runtime.sendMessage({
+        action: 'wblock:zapper:setDisabled',
+        hostname: host,
+        disabled: Boolean(disabled)
+      }), NATIVE_MESSAGE_TIMEOUT_MS, 'Zapper state update timed out.');
+    } catch {
+      return null;
+    }
+  }
+
+  async function migrateLegacyZapperRulesDisabled(host, rules = null, legacyDisabled) {
+    if (!host) return false;
+    const key = `wblock.zapperRulesDisabled.v1:${host}`;
+    try {
+      if (legacyDisabled === undefined) legacyDisabled = (await browser.storage.local.get(key))[key] === true;
+      if (!legacyDisabled) {
+        return false;
+      }
+      if (Array.isArray(rules) && rules.length > 0) {
+        await syncRulesToNative(host, rules);
+      }
+      const response = await setSiteZapperDisabled(host, true);
+      // Keep the legacy flag unless native confirmed the write, so a failed or timed-out write retries on the next load.
+      if (response && response.ok === true) await browser.storage.local.remove(key);
+      return Boolean(response && response.disabled);
+    } catch {
+      return false;
+    }
+  }
+
+  async function getSiteDisabledState(host) {
+    if (!host) return false;
+    try {
+      const response = await withTimeout(browser.runtime.sendMessage({
+        action: 'wblock:getSiteDisabledState',
+        host
+      }), NATIVE_MESSAGE_TIMEOUT_MS, 'Site state lookup timed out.');
+      if (!response || response.ok !== true || typeof response.disabled !== 'boolean') {
+        return null;
+      }
+      return Boolean(response && response.disabled);
+    } catch {
+      return null;
+    }
+  }
+
+  async function shouldSuppressZapperRules(host) {
+    if (state.rulesDisabled === true || state.zapperPaused === true) return true;
+    const siteDisabled = await getSiteDisabledState(host);
+    // Unknown must not reactivate rules on a site that may be globally disabled.
+    return siteDisabled !== false;
+  }
+
+  function normalizeRules(rules) {
+    return Array.from(new Set(
+      (Array.isArray(rules) ? rules : [])
+        .filter((s) => typeof s === 'string')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+    ));
+  }
+
+  function rulesSignature(rules) {
+    return normalizeRules(rules).join('\u001f');
+  }
+
+  function normalizeMeta(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const lastLocalEditAt = Number(source.lastLocalEditAt);
+    const lastSyncAt = Number(source.lastSyncAt);
+    const pendingSync = Boolean(source.pendingSync);
+    return {
+      pendingSync,
+      // Null marks pending state saved before edits were kept as deltas. A synced
+      // host has no delta, so a leftover one can never be replayed later.
+      pendingAdded: !pendingSync ? [] : Array.isArray(source.pendingAdded) ? normalizeRules(source.pendingAdded) : null,
+      pendingRemoved: pendingSync ? normalizeRules(source.pendingRemoved) : [],
+      lastLocalEditAt: Number.isFinite(lastLocalEditAt) ? lastLocalEditAt : 0,
+      lastSyncAt: Number.isFinite(lastSyncAt) ? lastSyncAt : 0,
+      disabled: source.disabled === true
+    };
+  }
+
+  // Pending edits travel as add/remove deltas. Pushing the full local list after a
+  // failed sync would erase rules added elsewhere (Share Sheet, another tab).
+  const pendingDeltaOf = (meta) => (meta.pendingAdded === null ? null : { added: meta.pendingAdded, removed: meta.pendingRemoved });
+  const deltaKey = (delta) => JSON.stringify([delta.added, delta.removed]);
+  function mergeDelta(base, edit) {
+    const added = new Set(base.added);
+    const removed = new Set(base.removed);
+    for (const selector of edit.added) {
+      removed.delete(selector);
+      added.add(selector);
+    }
+    for (const selector of edit.removed) {
+      added.delete(selector);
+      removed.add(selector);
+    }
+    return { added: [...added], removed: [...removed] };
+  }
+
+  async function getSyncMeta(host) {
+    if (!host) return normalizeMeta(null);
+    try {
+      const key = metaKey(host);
+      const result = await browser.storage.local.get(key);
+      return normalizeMeta(result[key]);
+    } catch {
+      return normalizeMeta(null);
+    }
+  }
+
+  // Until native answers on a fresh page, the last known pause keeps rules off.
+  const PAUSED_CACHE_KEY = 'wblock.zapperPaused.v1';
+  async function loadSiteState(host) {
+    const legacyKey = `wblock.zapperRulesDisabled.v1:${host}`;
+    const cached = await browser.storage.local.get([storageKey(host), metaKey(host), legacyKey, PAUSED_CACHE_KEY]).catch(() => ({}));
+    return { rules: normalizeRules(cached[storageKey(host)]),
+      meta: normalizeMeta(cached[metaKey(host)]), legacyDisabled: cached[legacyKey] === true,
+      paused: cached[PAUSED_CACHE_KEY] === true };
+  }
+
+  function normalizeNativeZapperState(response) {
+    if (!response || !Array.isArray(response.rules)) {
+      return null;
+    }
+    return {
+      rules: normalizeRules(response.rules),
+      inheritedRules: normalizeRules(response.inheritedRules),
+      disabled: response.disabled === true,
+      paused: response.paused === true
+    };
+  }
+
+  async function setSyncMeta(host, patch) {
+    if (!host) return;
+    const key = metaKey(host);
+    const current = await getSyncMeta(host);
+    const next = normalizeMeta({
+      ...current,
+      ...patch
+    });
+    await browser.storage.local.set({ [key]: next });
+  }
+
+  // A delta merges into the native list. The full list always rides along: relays
+  // that only forward `rules` (the Share Sheet shim) then fall back to a full replace
+  // instead of clearing the host.
+  async function syncRulesToNative(host, rules, delta = null) {
+    if (!host) return null;
+    const payload = { rules: normalizeRules(rules) };
+    if (delta) {
+      payload.added = normalizeRules(delta.added);
+      payload.removed = normalizeRules(delta.removed);
+    }
+    try {
+      const response = await withTimeout(browser.runtime.sendMessage({
+        action: 'wblock:zapper:syncRules',
+        hostname: host,
+        ...payload
+      }), NATIVE_MESSAGE_TIMEOUT_MS, 'Zapper sync timed out.');
+      // If the native side returned an authoritative rules list (e.g. after
+      // filtering out app-deleted rules), update browser.storage.local to match.
+      if (response && Array.isArray(response.rules)) {
+        const key = storageKey(host);
+        const normalized = normalizeRules(response.rules);
+        await browser.storage.local.set({ [key]: normalized });
+        // An edit that merged into the pending delta while this sync was in flight
+        // stays pending; its own sync clears it.
+        const current = pendingDeltaOf(await getSyncMeta(host));
+        const settled = !delta || (current !== null && deltaKey(current) === deltaKey(delta));
+        await setSyncMeta(host, settled
+          ? { pendingSync: false, pendingAdded: [], pendingRemoved: [], lastSyncAt: Date.now() }
+          : { lastSyncAt: Date.now() });
+        return normalized;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchRulesFromNative(host) {
+    if (!host) return null;
+    try {
+      const initialization = globalThis.__wblockZapperInitialization;
+      delete globalThis.__wblockZapperInitialization;
+      const response = await initialization || await withTimeout(browser.runtime.sendMessage({
+        action: 'wblock:zapper:getRules',
+        hostname: host
+      }), NATIVE_MESSAGE_TIMEOUT_MS, 'Zapper fetch timed out.');
+      const nativeState = normalizeNativeZapperState(response);
+      if (!nativeState) {
+        return null;
+      }
+      const { rules: localRules, meta, legacyDisabled, paused: cachedPaused } = await loadSiteState(host);
+      const localSig = rulesSignature(localRules);
+      const nativeSig = rulesSignature(nativeState.rules);
+      if (meta.pendingSync && localSig !== nativeSig) {
+        const reconciled = await syncRulesToNative(host, localRules, pendingDeltaOf(meta));
+        const rules = Array.isArray(reconciled) ? reconciled : localRules;
+        const disabled = nativeState.disabled || await migrateLegacyZapperRulesDisabled(host, rules, legacyDisabled);
+        await setSyncMeta(host, { disabled });
+        return { rules, disabled, paused: nativeState.paused, inheritedRules: nativeState.inheritedRules };
+      }
+      const disabled = nativeState.disabled || await migrateLegacyZapperRulesDisabled(host, nativeState.rules.length === 0 ? localRules : null, legacyDisabled);
+      const updates = {};
+      if (localSig !== nativeSig || meta.disabled !== disabled || meta.pendingSync) {
+        updates[storageKey(host)] = nativeState.rules;
+        updates[metaKey(host)] = { ...meta, pendingSync: false, pendingAdded: [], pendingRemoved: [], lastSyncAt: Date.now(), disabled };
+      }
+      if (cachedPaused !== nativeState.paused) updates[PAUSED_CACHE_KEY] = nativeState.paused;
+      if (Object.keys(updates).length) await browser.storage.local.set(updates);
+      return { rules: nativeState.rules, disabled, paused: nativeState.paused, inheritedRules: nativeState.inheritedRules };
+    } catch {
+      return null;
+    }
+  }
+
+  // `edit` lists the selectors this change added and removed. Only that delta is
+  // sent, so a stale local list cannot erase rules saved from another surface.
+  // Resolves to the list native kept, which the caller should adopt.
+  async function saveRulesForHost(host, rules, edit) {
+    if (!host) return null;
+    const key = storageKey(host);
+    const unique = normalizeRules(rules).slice(0, MAX_RULES_PER_SITE);
+    const meta = await getSyncMeta(host);
+    // Pending state from before deltas can only be resolved by pushing the full list.
+    const legacyPending = meta.pendingSync && meta.pendingAdded === null;
+    const pending = legacyPending ? null : mergeDelta(pendingDeltaOf(meta) || { added: [], removed: [] }, edit);
+    await browser.storage.local.set({ [key]: unique });
+    await setSyncMeta(host, {
+      pendingSync: true,
+      pendingAdded: pending ? pending.added : null,
+      pendingRemoved: pending ? pending.removed : [],
+      lastLocalEditAt: Date.now()
+    });
+    const reconciled = await syncRulesToNative(host, unique, pending);
+    return Array.isArray(reconciled) ? reconciled : unique;
+  }
+
+  function ensureStyleElement(id) {
+    let style = document.getElementById(id);
+    if (!style) {
+      style = document.createElement('style');
+      style.id = id;
+      (document.documentElement || document).appendChild(style);
+    }
+    return style;
+  }
+
+  function buildHideCss(selectors) {
+    return selectors.map((sel) => `${sel} { display: none !important; }`).join('\n');
+  }
+
+  async function applyRulesToPage(rules) {
+    const selectors = normalizeRules([...rules, ...state.inheritedRules]);
+    if (selectors.length === 0 && state.tempRules.length === 0) {
+      // Clearing needs no permission lookup, and empty frames need no styles.
+      for (const id of [STYLE_ID, TEMP_STYLE_ID]) {
+        const style = document.getElementById(id);
+        if (style && style.textContent) style.textContent = '';
+      }
+      return;
+    }
+    const style = ensureStyleElement(STYLE_ID);
+    const tempStyle = ensureStyleElement(TEMP_STYLE_ID);
+    const suppressed = await shouldSuppressZapperRules(state.host || safeHostname());
+    style.textContent = suppressed ? '' : buildHideCss(selectors);
+    tempStyle.textContent = suppressed ? '' : buildHideCss(state.tempRules);
+  }
+
+  function cssEscape(value) {
+    try {
+      if (window.CSS && typeof window.CSS.escape === 'function') {
+        return window.CSS.escape(value);
+      }
+    } catch {}
+    return String(value).replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
+  }
+
+  function isUniqueSelector(selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
+    } catch {
+      return false;
+    }
+  }
+
+  function selectorForElement(element) {
+    if (!(element instanceof Element)) return null;
+    if (element === document.documentElement || element === document.body) return null;
+    if (element.id) {
+      const idSel = `#${cssEscape(element.id)}`;
+      if (isUniqueSelector(idSel)) return idSel;
+    }
+
+    const tag = element.tagName.toLowerCase();
+    const classes = Array.from(element.classList || []).filter(Boolean).slice(0, 3);
+    if (classes.length > 0) {
+      const classSel = `${tag}${classes.map((c) => `.${cssEscape(c)}`).join('')}`;
+      if (isUniqueSelector(classSel)) return classSel;
+    }
+
+    const segments = [];
+    let current = element;
+    let depth = 0;
+    while (current && current instanceof Element && current !== document.documentElement && depth < 12) {
+      const currentTag = current.tagName.toLowerCase();
+      let segment = currentTag;
+
+      const currentId = current.id ? `#${cssEscape(current.id)}` : '';
+      // A unique id anchors the path collected below it, not the ancestor itself.
+      if (currentId && isUniqueSelector(`${currentTag}${currentId}`)) {
+        return [`${currentTag}${currentId}`, ...segments].join(' > ');
+      }
+
+      const currentClasses = Array.from(current.classList || []).filter(Boolean).slice(0, 1);
+      if (currentClasses.length) {
+        segment += `.${cssEscape(currentClasses[0])}`;
+      }
+
+      const parent = current.parentElement;
+      if (parent) {
+        const siblingsOfType = Array.from(parent.children).filter(
+          (child) => child.tagName === current.tagName
+        );
+        if (siblingsOfType.length > 1) {
+          const index = siblingsOfType.indexOf(current) + 1;
+          segment += `:nth-of-type(${index})`;
+        }
+      }
+
+      segments.unshift(segment);
+      const candidatePath = segments.join(' > ');
+      if (isUniqueSelector(candidatePath)) return candidatePath;
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    const fallback = segments.join(' > ');
+    return fallback || null;
+  }
+
+  function shouldIgnoreTarget(target) {
+    if (!(target instanceof Element)) return false;
+    if (target.id === STYLE_ID) return true;
+    return Boolean(target.closest && target.closest(`#${UI_ROOT_ID}`));
+  }
+
+  function uiButton(label, className, onActivate) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    if (className) button.className = className;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      onActivate();
+    });
+    return button;
+  }
+
+  // Footer icons share one size and baseline; text glyphs like ··· sat low.
+  function iconButton(pathData, label, onActivate) {
+    const button = uiButton('', 'wblock-step', onActivate);
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    line.setAttribute('d', pathData);
+    svg.append(line);
+    button.append(svg);
+    return button;
+  }
+
+  function ensureUi() {
+    if (state.ui.root) return;
+
+    // The panel renders in a closed shadow root, so page CSS and extensions
+    // that restyle pages (Dark Reader drew a white border on it) can't reach it.
+    const host = document.createElement('div');
+    host.id = UI_ROOT_ID;
+    host.style.cssText = 'all: initial !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 0 !important; height: 0 !important; z-index: 2147483647 !important;';
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const uiStyle = document.createElement('style');
+    uiStyle.textContent = `
+      #${UI_ROOT_ID} { all: initial; --wb-text: #1d1d1f; --wb-danger: rgb(229,72,77); --wb-danger-fill: rgba(229,72,77,0.16); --wb-panel: rgba(255,255,255,0.55); --wb-fill: rgba(120,120,128,0.14); --wb-menu: rgb(246,246,248); --wb-line: rgba(0,0,0,0.08); --wb-shadow: rgba(0,0,0,0.18); --wb-highlight: rgba(255,255,255,0.7); position: fixed; top: 50%; right: calc(10px + env(safe-area-inset-right, 0px)); transform: translateY(-50%); z-index: 2147483647; box-sizing: border-box; width: 108px; padding: 8px; border-radius: 22px; display: flex; flex-direction: column; gap: 6px; font-family: -apple-system, system-ui, sans-serif; font-size: 13px; line-height: 1.15; color: var(--wb-text) !important; background: var(--wb-panel); backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); border: 1px solid var(--wb-line); box-shadow: inset 0 1px 0 var(--wb-highlight), 0 10px 30px var(--wb-shadow); cursor: grab; touch-action: none; }
+      @media (prefers-color-scheme: dark) {
+        #${UI_ROOT_ID} { --wb-text: #f5f5f7; --wb-panel: rgba(36,36,40,0.82); --wb-fill: rgba(120,120,128,0.3); --wb-menu: rgb(44,44,48); --wb-line: rgba(255,255,255,0.12); --wb-shadow: rgba(0,0,0,0.4); --wb-highlight: rgba(255,255,255,0.14); --wb-danger: rgb(255,105,97); --wb-danger-fill: rgba(255,105,97,0.2); }
+      }
+      #${UI_ROOT_ID}.wblock-dragging { cursor: grabbing; }
+      #${UI_ROOT_ID}.wblock-left { right: auto; left: calc(10px + env(safe-area-inset-left, 0px)); }
+      #${UI_ROOT_ID}.wblock-left .wblock-overflow { right: auto; left: calc(100% + 8px); }
+      #${UI_ROOT_ID}.wblock-left #${TOAST_ID} { right: auto; left: 0; }
+      #${UI_ROOT_ID}:focus { outline: none; }
+      #${UI_ROOT_ID} button { all: initial; appearance: none; cursor: pointer; display: flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 0; min-height: 34px; margin: 0; border: 0; border-radius: 12px; padding: 7px 6px; background: var(--wb-fill); color: var(--wb-text) !important; font: inherit; font-size: 13px; font-weight: 600; line-height: 1.15; text-align: center; overflow-wrap: anywhere; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+      #${UI_ROOT_ID} button:active { filter: brightness(0.9); }
+      #${UI_ROOT_ID} button:disabled { opacity: 0.4; }
+      #${UI_ROOT_ID} .wblock-grip { width: 28px; height: 4px; margin: 0 auto 2px; border-radius: 2px; background: rgba(120,120,128,0.45); }
+      #${UI_ROOT_ID} .wblock-hide { color: var(--wb-danger) !important; }
+      #${UI_ROOT_ID} .wblock-hide.wblock-ready { background: var(--wb-danger-fill); }
+      #${UI_ROOT_ID} .wblock-footer { position: relative; display: flex; align-items: center; justify-content: space-between; }
+      #${UI_ROOT_ID} .wblock-step { flex: 0 0 30px; width: 30px; min-height: 28px; padding: 0; background: transparent; }
+      #${UI_ROOT_ID} .wblock-step svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+      #${UI_ROOT_ID} .wblock-overflow { display: flex; flex-direction: column; gap: 4px; position: absolute; right: calc(100% + 8px); bottom: 0; min-width: 170px; padding: 4px; border-radius: 14px; background: var(--wb-menu); border: 1px solid var(--wb-line); box-shadow: 0 8px 24px var(--wb-shadow); opacity: 0; transform: scale(0.97); transition: opacity 0.15s ease, transform 0.15s ease; pointer-events: none; }
+      #${UI_ROOT_ID} .wblock-overflow.wblock-open { opacity: 1; transform: scale(1); pointer-events: auto; }
+      /* Its buttons and field reset pointer-events with all: initial, so the
+         closed menu shuts them off too; otherwise its invisible items took
+         taps and opened the selector field. */
+      #${UI_ROOT_ID} .wblock-overflow:not(.wblock-open) * { pointer-events: none; }
+      #${UI_ROOT_ID} .wblock-overflow button { width: 100%; justify-content: flex-start; text-align: left; min-height: 36px; padding: 8px 10px; border-radius: 9px; background: var(--wb-fill); border: 1px solid var(--wb-line); font-weight: 500; }
+      #${UI_ROOT_ID} .wblock-history { display: flex; gap: 4px; }
+      #${UI_ROOT_ID} .wblock-history button { flex: 1 1 0; justify-content: center; text-align: center; }
+      #${UI_ROOT_ID} .wblock-rule-form { display: none; flex-direction: column; gap: 6px; padding: 4px; }
+      #${UI_ROOT_ID} .wblock-overflow.wblock-editing > :not(.wblock-rule-form) { display: none; }
+      #${UI_ROOT_ID} .wblock-overflow.wblock-editing .wblock-rule-form { display: flex; }
+      /* iOS zooms the page into a focused field under 16px, so the field is
+         16px drawn at 13px to match the panel. */
+      #${UI_ROOT_ID} .wblock-rule-form input { all: initial; box-sizing: border-box; width: calc(100% / 0.8125); height: calc(34px / 0.8125); margin: 0 calc(-100% * 0.1875 / 0.8125) calc(34px - 34px / 0.8125) 0; padding: 0 11px; border-radius: 11px; background: var(--wb-fill); color: var(--wb-text); font: 16px -apple-system, system-ui, sans-serif; transform: scale(0.8125); transform-origin: 0 0; cursor: text; -webkit-user-select: text; user-select: text; }
+      #${UI_ROOT_ID} .wblock-rule-form button { justify-content: center; text-align: center; background: var(--wb-fill); font-weight: 600; }
+      #${HIGHLIGHT_ID} { position: fixed; pointer-events: none; z-index: 2147483646; border: 2px solid rgb(229,72,77); border-radius: 8px; background: rgba(229,72,77,0.08); transform: translate3d(0,0,0); }
+      #${TOAST_ID} { position: absolute; right: 0; bottom: calc(100% + 8px); display: none; pointer-events: none; }
+      #${TOAST_ID} .wblock-toast-inner { width: max-content; max-width: 200px; padding: 8px 10px; border-radius: 12px; background: var(--wb-menu); color: var(--wb-text); font-size: 12px; line-height: 1.3; text-align: center; box-shadow: 0 8px 24px var(--wb-shadow); }
+    `.trim();
+
+    const root = document.createElement('div');
+    root.id = UI_ROOT_ID;
+    root.tabIndex = -1;
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-label', t('zapper_aria_label', undefined, 'wBlock Element Zapper'));
+
+    const grip = document.createElement('div');
+    grip.className = 'wblock-grip';
+
+    const addRuleButton = uiButton(t('zapper_button_add_rule', undefined, 'Add Rule'), 'wblock-hide', () => confirmHide());
+    addRuleButton.disabled = true;
+
+    const hideOnceButton = uiButton(t('zapper_button_hide_once', undefined, 'Hide Once'), 'wblock-hide', () => confirmHide({ temporary: true }));
+    hideOnceButton.disabled = true;
+
+    const doneButton = uiButton(t('zapper_button_done', undefined, 'Done'), '', () => {
+      doneButton.disabled = true;
+      finalizeSession().catch(() => {});
+    });
+
+    const cancelButton = uiButton(t('zapper_button_cancel', undefined, 'Cancel'), '', () => cancelSession());
+
+    // --- Overflow menu (···) holds Undo and the custom rule prompt; it opens to the left ---
+    const overflowMenu = document.createElement('div');
+    overflowMenu.className = 'wblock-overflow';
+
+    const undoButton = uiButton(t('zapper_button_undo', undefined, 'Undo'), '', () => {
+      closeOverflow();
+      undoLastZap().catch(() => {});
+    });
+    undoButton.disabled = true;
+    const redoButton = uiButton(t('zapper_button_redo', undefined, 'Redo'), '', () => {
+      closeOverflow();
+      redoLastZap().catch(() => {});
+    });
+    redoButton.disabled = true;
+
+    // The custom rule field lives in the menu. window.prompt could be
+    // suppressed by Safari, which left the item with no response (#1066).
+    const ruleForm = document.createElement('form');
+    ruleForm.className = 'wblock-rule-form';
+    const ruleInput = document.createElement('input');
+    ruleInput.type = 'text';
+    ruleInput.autocapitalize = 'off';
+    ruleInput.autocomplete = 'off';
+    ruleInput.spellcheck = false;
+    ruleInput.placeholder = t('zapper_prompt_enter_selector', undefined, 'Enter CSS selector for this site');
+    const ruleSubmit = document.createElement('button');
+    ruleSubmit.type = 'submit';
+    ruleSubmit.textContent = t('zapper_button_add_rule', undefined, 'Add Rule');
+    ruleForm.append(ruleInput, ruleSubmit);
+    ruleForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      addManualRule(ruleInput.value).then((added) => {
+        if (!added) return;
+        ruleInput.value = '';
+        closeOverflow();
+      }).catch(() => {});
+    });
+    ruleInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeOverflow();
+    });
+
+    const manualButton = uiButton(t('zapper_button_add_custom_rule', undefined, 'Add Custom CSS Rule…'), '', () => {
+      overflowMenu.classList.add('wblock-editing');
+      ruleInput.focus();
+    });
+    // Undo and Redo share a row; the menu has the width for both.
+    const historyRow = document.createElement('div');
+    historyRow.className = 'wblock-history';
+    historyRow.append(undoButton, redoButton);
+    overflowMenu.append(historyRow, manualButton, ruleForm);
+
+    function closeOverflow() {
+      overflowMenu.classList.remove('wblock-open', 'wblock-editing');
+      ruleInput.blur();
+    }
+
+    const footer = document.createElement('div');
+    footer.className = 'wblock-footer';
+    const moreButton = iconButton('M3 8h.01 M8 8h.01 M13 8h.01', t('zapper_button_more', undefined, 'More options'), () => {
+      if (overflowMenu.classList.contains('wblock-open')) closeOverflow();
+      else overflowMenu.classList.add('wblock-open');
+    });
+    // Parent and child flank ··· so touch screens can step the selection
+    // without growing the panel; the arrow keys do the same on a Mac.
+    const parentButton = iconButton('M3 10 L8 5 L13 10', t('zapper_button_select_parent', undefined, 'Select parent element'), () => navigateParent());
+    const childButton = iconButton('M3 6 L8 11 L13 6', t('zapper_button_select_child', undefined, 'Select child element'), () => navigateChild());
+    parentButton.disabled = true;
+    childButton.disabled = true;
+    footer.append(parentButton, moreButton, childButton, overflowMenu);
+
+    const onOverflowOutside = (event) => {
+      if (!overflowMenu.classList.contains('wblock-open')) return;
+      if (event.target === host || footer.contains(event.target)) return;
+      closeOverflow();
+    };
+    // Page taps reach document with the host as target; panel taps are
+    // checked inside the shadow root, where the real target is visible.
+    document.addEventListener('pointerdown', onOverflowOutside, true);
+    shadow.addEventListener('pointerdown', onOverflowOutside, true);
+    state.cleanupFns.push(
+      () => document.removeEventListener('pointerdown', onOverflowOutside, true),
+      () => shadow.removeEventListener('pointerdown', onOverflowOutside, true),
+    );
+
+    const highlight = document.createElement('div');
+    highlight.id = HIGHLIGHT_ID;
+    highlight.style.display = 'none';
+
+    const toast = document.createElement('div');
+    toast.id = TOAST_ID;
+    const toastInner = document.createElement('div');
+    toastInner.className = 'wblock-toast-inner';
+    toast.appendChild(toastInner);
+
+    root.append(grip, addRuleButton, hideOnceButton, doneButton, cancelButton, footer, toast);
+
+    state.ui.root = root;
+    state.ui.host = host;
+    state.ui.shadow = shadow;
+    state.ui.highlight = highlight;
+    state.ui.toast = toast;
+    state.ui.undoButton = undoButton;
+    state.ui.redoButton = redoButton;
+    state.ui.addRuleButton = addRuleButton;
+    state.ui.parentButton = parentButton;
+    state.ui.childButton = childButton;
+    state.ui.hideOnceButton = hideOnceButton;
+
+    // --- Drag-to-move logic ---
+    // A press on the panel body only arms a drag. The panel moves once the
+    // pointer has travelled DRAG_THRESHOLD_PX, so taps and small jitters on
+    // the panel never move it, and buttons never arm a drag at all. On release
+    // it settles against the nearer side edge.
+    const DRAG_THRESHOLD_PX = 6;
+    let offsetX = 0;
+    let offsetY = 0;
+    let press = null;
+    let dragStart = null;
+
+    const placePanel = (x, y) => {
+      root.style.transform = `translate(${x}px, calc(-50% + ${y}px))`;
+    };
+
+    function moveDrag(clientX, clientY) {
+      if (!press) return false;
+      if (!dragStart) {
+        if (Math.hypot(clientX - press.x, clientY - press.y) < DRAG_THRESHOLD_PX) return false;
+        const rect = root.getBoundingClientRect();
+        dragStart = { ...press, offsetX, offsetY, baseLeft: rect.left - offsetX };
+        root.style.transition = '';
+        root.classList.add('wblock-dragging');
+      }
+      const width = root.offsetWidth;
+      offsetX = Math.max(4 - dragStart.baseLeft, Math.min(window.innerWidth - 4 - width - dragStart.baseLeft,
+        dragStart.offsetX + clientX - dragStart.x));
+      // Keep room above the panel for the toast, which sits there.
+      const room = window.innerHeight / 2 - root.offsetHeight / 2;
+      offsetY = Math.max(-(room - 56), Math.min(room - 4, dragStart.offsetY + clientY - dragStart.y));
+      placePanel(offsetX, offsetY);
+      return true;
+    }
+
+    function endDrag() {
+      const dragged = dragStart !== null;
+      press = null;
+      dragStart = null;
+      root.classList.remove('wblock-dragging');
+      if (!dragged) return;
+      const before = root.getBoundingClientRect();
+      root.classList.toggle('wblock-left', before.left + before.width / 2 < window.innerWidth / 2);
+      offsetX = 0;
+      placePanel(0, offsetY);
+      const shift = before.left - root.getBoundingClientRect().left;
+      if (!shift) return;
+      // Start from where the finger let go and glide to the edge.
+      root.style.transition = 'none';
+      placePanel(shift, offsetY);
+      root.getBoundingClientRect();
+      root.style.transition = 'transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1)';
+      placePanel(0, offsetY);
+    }
+
+    const onPanelPointerDown = (e) => {
+      if (e.target.closest('button, .wblock-overflow')) return;
+      press = { x: e.clientX, y: e.clientY };
+    };
+    const onPanelTouchStart = (e) => {
+      if (e.target.closest('button, .wblock-overflow')) return;
+      if (e.touches.length !== 1) return;
+      press = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    };
+    const onDocPointerMove = (e) => { if (moveDrag(e.clientX, e.clientY)) e.preventDefault(); };
+    const onDocTouchMove = (e) => { if (e.touches[0] && moveDrag(e.touches[0].clientX, e.touches[0].clientY)) e.preventDefault(); };
+    const onDocPointerEnd = () => endDrag();
+
+    root.addEventListener('pointerdown', onPanelPointerDown);
+    root.addEventListener('touchstart', onPanelTouchStart, { passive: true });
+    document.addEventListener('pointermove', onDocPointerMove, { passive: false });
+    document.addEventListener('touchmove', onDocTouchMove, { passive: false });
+    document.addEventListener('pointerup', onDocPointerEnd);
+    document.addEventListener('pointercancel', onDocPointerEnd);
+    document.addEventListener('touchend', onDocPointerEnd);
+    document.addEventListener('touchcancel', onDocPointerEnd);
+
+    state.cleanupFns.push(
+      () => root.removeEventListener('pointerdown', onPanelPointerDown),
+      () => root.removeEventListener('touchstart', onPanelTouchStart),
+      () => document.removeEventListener('pointermove', onDocPointerMove, { passive: false }),
+      () => document.removeEventListener('touchmove', onDocTouchMove, { passive: false }),
+      () => document.removeEventListener('pointerup', onDocPointerEnd),
+      () => document.removeEventListener('pointercancel', onDocPointerEnd),
+      () => document.removeEventListener('touchend', onDocPointerEnd),
+      () => document.removeEventListener('touchcancel', onDocPointerEnd),
+    );
+
+    shadow.append(uiStyle, highlight, root);
+    (document.documentElement || document).appendChild(host);
+  }
+
+  function showToast(message) {
+    if (!state.active) return;
+    ensureUi();
+    const toast = state.ui.toast;
+    if (!toast) return;
+    const inner = toast.querySelector('.wblock-toast-inner');
+    if (inner) inner.textContent = message;
+    toast.style.display = 'flex';
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => {
+      toast.style.display = 'none';
+    }, 1400);
+  }
+
+  function setHighlightForElement(element) {
+    ensureUi();
+    const highlight = state.ui.highlight;
+    if (!highlight) return;
+    if (!(element instanceof Element) || shouldIgnoreTarget(element)) {
+      highlight.style.display = 'none';
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      highlight.style.display = 'none';
+      return;
+    }
+    if (rect.bottom <= 0 || rect.top >= window.innerHeight ||
+        rect.right <= 0 || rect.left >= window.innerWidth) {
+      highlight.style.display = 'none';
+      return;
+    }
+    highlight.style.display = 'block';
+    highlight.style.top = `${Math.max(0, rect.top)}px`;
+    highlight.style.left = `${Math.max(0, rect.left)}px`;
+    highlight.style.width = `${Math.max(0, rect.width)}px`;
+    highlight.style.height = `${Math.max(0, rect.height)}px`;
+  }
+
+  function clearHighlight() {
+    if (state.ui.highlight) state.ui.highlight.style.display = 'none';
+  }
+
+  function getPointFromEvent(event) {
+    if (event && typeof event.clientX === 'number' && typeof event.clientY === 'number') {
+      return { x: event.clientX, y: event.clientY };
+    }
+    if (event && event.touches && event.touches[0]) {
+      return { x: event.touches[0].clientX, y: event.touches[0].clientY };
+    }
+    return null;
+  }
+
+  function elementFromEvent(event) {
+    const point = getPointFromEvent(event);
+    if (!point) return null;
+    try {
+      return document.elementFromPoint(point.x, point.y);
+    } catch {
+      return null;
+    }
+  }
+
+  function isValidCssSelector(selector) {
+    try {
+      document.createDocumentFragment().querySelector(selector);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function parseManualRuleInput(input) {
+    const raw = String(input || '').trim();
+    if (!raw) {
+      return { selector: '', error: t('zapper_error_enter_selector', undefined, 'Enter a CSS selector.') };
+    }
+
+    let selector = raw;
+    if (raw.includes('{')) {
+      const openIndex = raw.indexOf('{');
+      const closeIndex = raw.lastIndexOf('}');
+      if (closeIndex <= openIndex) {
+        return { selector: '', error: t('zapper_error_rule_syntax_invalid', undefined, 'CSS rule syntax is invalid.') };
+      }
+      if (raw.slice(closeIndex + 1).trim().length > 0) {
+        return { selector: '', error: t('zapper_error_rule_syntax_invalid', undefined, 'CSS rule syntax is invalid.') };
+      }
+      selector = raw.slice(0, openIndex).trim();
+    } else if (raw.includes('}')) {
+      return { selector: '', error: t('zapper_error_rule_syntax_invalid', undefined, 'CSS rule syntax is invalid.') };
+    }
+
+    if (!selector) {
+      return { selector: '', error: t('zapper_error_enter_selector', undefined, 'Enter a CSS selector.') };
+    }
+    if (selector.length > 512) {
+      return { selector: '', error: t('zapper_error_selector_too_long', undefined, 'Selector is too long.') };
+    }
+    if (!isValidCssSelector(selector)) {
+      return { selector: '', error: t('zapper_error_selector_syntax_invalid', undefined, 'Selector syntax is invalid.') };
+    }
+
+    return { selector, error: '' };
+  }
+
+  async function addSelectorRule(selector, options = {}) {
+    const normalized = (selector || '').trim();
+    if (!normalized) return false;
+    if (state.rules.includes(normalized) || state.tempRules.includes(normalized)) {
+      showToast(options.manual
+        ? t('zapper_toast_rule_exists', undefined, 'Rule already exists.')
+        : t('zapper_toast_already_hidden', undefined, 'Already hidden.'));
+      return false;
+    }
+    const temporary = options.temporary === true;
+    state.undoStack.push({ selector: normalized, temporary });
+    // A new hide forks history; a redo replays it.
+    if (!options.redo) state.redoStack = [];
+    if (temporary) {
+      state.tempRules = state.tempRules.concat([normalized]).slice(0, MAX_RULES_PER_SITE);
+    } else {
+      state.rules = state.rules.concat([normalized]).slice(0, MAX_RULES_PER_SITE);
+      state.rules = (await trackPendingSave(saveRulesForHost(state.host, state.rules, { added: [normalized], removed: [] }))) ?? state.rules;
+    }
+    await applyRulesToPage(state.rules);
+    if (!state.active) return true;
+    syncHistoryButtons();
+    showToast(temporary
+      ? t('zapper_toast_hidden_until_reload', undefined, 'Hidden until reload.')
+      : options.manual
+        ? t('zapper_toast_rule_saved', undefined, 'Rule saved for this site.')
+        : t('zapper_toast_hidden_and_saved', undefined, 'Hidden. Rule saved for this site.'));
+    return true;
+  }
+
+  // Returns true once the rule is saved, so the field clears only then.
+  async function addManualRule(rawInput) {
+    const parsed = parseManualRuleInput(rawInput);
+    if (parsed.error) {
+      showToast(parsed.error);
+      return false;
+    }
+    return addSelectorRule(parsed.selector, { manual: true });
+  }
+
+  // Drops the newest hide, or every hide from this session when `all` is set.
+  // Permanent hides leave the saved rules (synced like any edit); temporary
+  // hides only leave the in-memory list.
+  async function revertZaps(all = false) {
+    const entries = all ? state.undoStack.splice(0) : state.undoStack.splice(-1);
+    if (entries.length === 0) return entries;
+    const temporary = new Set(entries.filter((e) => e.temporary).map((e) => e.selector));
+    const permanent = new Set(entries.filter((e) => !e.temporary).map((e) => e.selector));
+    state.tempRules = state.tempRules.filter((r) => !temporary.has(r));
+    if (permanent.size > 0) {
+      state.rules = state.rules.filter((r) => !permanent.has(r));
+      state.rules = (await trackPendingSave(saveRulesForHost(state.host, state.rules, { added: [], removed: [...permanent] }))) ?? state.rules;
+    }
+    await applyRulesToPage(state.rules);
+    return entries;
+  }
+
+  function syncHistoryButtons() {
+    if (state.ui.undoButton) state.ui.undoButton.disabled = state.undoStack.length === 0;
+    if (state.ui.redoButton) state.ui.redoButton.disabled = state.redoStack.length === 0;
+  }
+
+  async function undoLastZap() {
+    const entries = await revertZaps();
+    if (entries.length === 0) return;
+    state.redoStack.push(...entries);
+    if (!state.active) return;
+    syncHistoryButtons();
+    showToast(t('zapper_toast_undone', undefined, 'Undone.'));
+  }
+
+  async function redoLastZap() {
+    const entry = state.redoStack.pop();
+    if (!entry) return;
+    await addSelectorRule(entry.selector, { temporary: entry.temporary, redo: true });
+    syncHistoryButtons();
+  }
+
+  // Cancel closes the panel and reverts every hide made in this session.
+  function cancelSession() {
+    deactivateZapper({ removeUi: true });
+    return revertZaps(true).catch(() => {});
+  }
+
+  function addCleanup(fn) {
+    state.cleanupFns.push(fn);
+  }
+
+  function teardownUi() {
+    clearTimeout(showToast._timer);
+    // The host carries the shadow root with the panel, highlight, and toast.
+    try {
+      if (state.ui.host) state.ui.host.remove();
+      const hostEl = document.getElementById(UI_ROOT_ID);
+      if (hostEl) hostEl.remove();
+    } catch {}
+
+    for (const key of Object.keys(state.ui)) state.ui[key] = null;
+  }
+
+  function clearCleanup() {
+    const fns = state.cleanupFns.slice();
+    state.cleanupFns = [];
+    for (const fn of fns) {
+      try {
+        fn();
+      } catch {}
+    }
+  }
+
+  function interceptEvent(event) {
+    if (!event) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  // Events from the closed shadow root reach document with the host as
+  // target; the focused field inside is the real one.
+  function realEventTarget(event) {
+    const target = event && event.target;
+    if (target && target === state.ui.host && state.ui.shadow) {
+      return state.ui.shadow.activeElement || target;
+    }
+    return target;
+  }
+
+  function isTextEntryTarget(target) {
+    if (!(target instanceof Element)) return false;
+    if (target.isContentEditable) return true;
+    return target.matches('textarea, select, input:not([type=button]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=reset]):not([type=range]):not([type=color]):not([type=file]):not([type=image])');
+  }
+
+  function isZapperBoundary(el) {
+    return !el || el === document.body || el === document.documentElement;
+  }
+
+  function syncPanelState() {
+    const ready = Boolean(state.candidateElement);
+    for (const button of [state.ui.addRuleButton, state.ui.hideOnceButton]) {
+      if (!button) continue;
+      button.disabled = !ready;
+      button.classList.toggle('wblock-ready', ready);
+    }
+    if (state.ui.parentButton) state.ui.parentButton.disabled = !ready || isZapperBoundary(state.candidateElement.parentElement);
+    if (state.ui.childButton) state.ui.childButton.disabled = state.traversalPath.length === 0;
+  }
+
+  function enterRefineMode(element) {
+    state.candidateElement = element;
+    state.traversalPath = [];
+    setHighlightForElement(element);
+    syncPanelState();
+  }
+
+  function clearSelection() {
+    state.candidateElement = null;
+    state.traversalPath = [];
+    clearHighlight();
+    syncPanelState();
+  }
+
+  function navigateParent() {
+    const candidate = state.candidateElement;
+    if (!candidate) return;
+    const parent = candidate.parentElement;
+    if (isZapperBoundary(parent)) return;
+    state.traversalPath.push(candidate);
+    state.candidateElement = parent;
+    setHighlightForElement(parent);
+    syncPanelState();
+  }
+
+  function navigateChild() {
+    if (state.traversalPath.length === 0) return;
+    state.candidateElement = state.traversalPath.pop();
+    setHighlightForElement(state.candidateElement);
+    syncPanelState();
+  }
+
+  // Add Rule saves a permanent rule; Hide Once (temporary) lasts until reload.
+  function confirmHide(options = {}) {
+    const el = state.candidateElement;
+    if (!el) return;
+    const selector = selectorForElement(el);
+    clearSelection();
+    if (!selector) {
+      showToast(t('zapper_toast_unable_create_rule', undefined, 'Unable to create a rule for that element.'));
+      return;
+    }
+    addSelectorRule(selector, { temporary: options.temporary === true }).catch(() => {});
+  }
+
+  // Element under the last right click, used by the "Zap Element" context
+  // menu to preselect its target. Cleared as soon as it is consumed.
+  let lastContextMenuTarget = null;
+
+  function preselectContextMenuTarget() {
+    const el = lastContextMenuTarget;
+    lastContextMenuTarget = null;
+    if (!el || !el.isConnected || shouldIgnoreTarget(el)) return;
+    enterRefineMode(el);
+  }
+
+  async function activateZapper(options = {}) {
+    if (state.active) {
+      if (options.fromContextMenu === true) preselectContextMenuTarget();
+      return true;
+    }
+    // A subframe that skipped the load-time lookup still needs its rules before it decides.
+    await reloadRulesAndApplyCoalesced().catch(() => {});
+    if (await shouldSuppressZapperRules(state.host)) {
+      return false;
+    }
+    ensureUi();
+    state.active = true;
+    startRuleSyncLoop();
+    state.undoStack = [];
+    state.redoStack = [];
+    state.lastPickAt = 0;
+    state.pressPicked = false;
+    clearSelection();
+    state.lastPointerX = -1;
+    state.lastPointerY = -1;
+    state.isScrolling = false;
+    syncHistoryButtons();
+    showToast(t('zapper_toast_enabled', undefined, 'Element Zapper enabled.'));
+    if (options.fromContextMenu === true) preselectContextMenuTarget();
+
+    // After the popup closes, keyboard focus stays on Safari's chrome.
+    // Without explicit focus, keydown events (like Escape) never reach our
+    // listeners. Retry briefly so Activate works even if the first focus is stolen.
+    const focusZapperRoot = () => {
+      if (!state.active) return;
+      const rootEl = state.ui.root;
+      if (rootEl && typeof rootEl.focus === 'function') {
+        try {
+          rootEl.focus({ preventScroll: true });
+        } catch {
+          rootEl.focus();
+        }
+      }
+    };
+    focusZapperRoot();
+    setTimeout(focusZapperRoot, 0);
+    setTimeout(focusZapperRoot, 50);
+    setTimeout(focusZapperRoot, 150);
+
+    const onMove = (event) => {
+      if (!state.active) return;
+      if (state.candidateElement) return;
+      if (shouldIgnoreTarget(event && event.target)) return;
+      const point = getPointFromEvent(event);
+      if (point) {
+        state.lastPointerX = point.x;
+        state.lastPointerY = point.y;
+      }
+      const el = elementFromEvent(event);
+      if (!el || shouldIgnoreTarget(el)) return;
+      setHighlightForElement(el);
+    };
+
+    const pickFromEvent = (event) => {
+      if (!state.active) return;
+      if (state.isScrolling) return;
+      if (shouldIgnoreTarget(event && event.target)) return;
+      const now = Date.now();
+      if (now - state.lastPickAt < 120) return;
+      const el = elementFromEvent(event);
+      if (!el || shouldIgnoreTarget(el)) return;
+      interceptEvent(event);
+      focusZapperRoot();
+      state.lastPickAt = now;
+      // The click that ends this press must not count as a second tap.
+      if (event.type !== 'click') state.pressPicked = true;
+      const current = state.candidateElement;
+      if (current && current.contains(el)) {
+        navigateParent();
+      } else {
+        enterRefineMode(el);
+      }
+    };
+
+    // Prevent navigation/actions that fire on click (e.g. <a href=...>) while
+    // the zapper is active. On iOS Safari, preventing pointer/touch events
+    // alone does not always cancel the subsequent click.
+    const onClick = (event) => {
+      if (!state.active) return;
+      if (shouldIgnoreTarget(event && event.target)) return;
+      interceptEvent(event);
+
+      // A slow tap's click lands well after its press; a timer let it through
+      // as a second tap, which climbed one parent per slow tap.
+      if (state.pressPicked) {
+        state.pressPicked = false;
+        return;
+      }
+      pickFromEvent(event);
+    };
+
+    const onKeyDown = (event) => {
+      if (!state.active) return;
+      if (!event) return;
+      // Typing in the panel's rule field must not pick, hide, or close.
+      const keyTarget = realEventTarget(event);
+      if (shouldIgnoreTarget(event.target) && isTextEntryTarget(keyTarget)) return;
+      if (event.key === 'Escape') {
+        interceptEvent(event);
+        if (state.candidateElement) {
+          clearSelection();
+        } else {
+          deactivateZapper({ removeUi: true });
+        }
+        return;
+      }
+      // ArrowUp selects the parent, ArrowDown returns to the child picked last.
+      // Arrows typed into page fields keep their normal caret movement.
+      if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && !isTextEntryTarget(keyTarget)) {
+        interceptEvent(event);
+        if (event.key === 'ArrowUp') navigateParent();
+        else navigateChild();
+        return;
+      }
+      if (event.key === 'Enter' && state.candidateElement) {
+        interceptEvent(event);
+        confirmHide();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && (event.key === 'z' || event.key === 'Z')) {
+        interceptEvent(event);
+        (event.shiftKey ? redoLastZap() : undoLastZap()).catch(() => {});
+      }
+    };
+
+    const moveEvent = 'PointerEvent' in window ? 'pointermove' : 'mousemove';
+    const downEvent = 'PointerEvent' in window ? 'pointerdown' : 'mousedown';
+    const touchOptions = { capture: true, passive: false };
+
+    document.addEventListener(moveEvent, onMove, true);
+    document.addEventListener(downEvent, pickFromEvent, true);
+    document.addEventListener('click', onClick, true);
+    // Ensure preventDefault works for touch-driven clicks.
+    document.addEventListener('touchstart', pickFromEvent, touchOptions);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keydown', onKeyDown, true);
+
+    addCleanup(() => document.removeEventListener(moveEvent, onMove, true));
+    addCleanup(() => document.removeEventListener(downEvent, pickFromEvent, true));
+    addCleanup(() => document.removeEventListener('click', onClick, true));
+    addCleanup(() => document.removeEventListener('touchstart', pickFromEvent, touchOptions));
+    addCleanup(() => document.removeEventListener('keydown', onKeyDown, true));
+    addCleanup(() => window.removeEventListener('keydown', onKeyDown, true));
+
+    let scrollTimer = 0;
+    const onScroll = () => {
+      if (!state.active) return;
+      state.isScrolling = true;
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => { state.isScrolling = false; }, 150);
+      if (state.candidateElement) {
+        setHighlightForElement(state.candidateElement);
+      } else if (state.lastPointerX >= 0 && state.lastPointerY >= 0) {
+        try {
+          const el = document.elementFromPoint(state.lastPointerX, state.lastPointerY);
+          if (el && !shouldIgnoreTarget(el)) {
+            setHighlightForElement(el);
+          }
+        } catch {}
+      }
+    };
+
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+    addCleanup(() => {
+      window.removeEventListener('scroll', onScroll, true);
+      clearTimeout(scrollTimer);
+      state.isScrolling = false;
+    });
+    return true;
+  }
+
+  function deactivateZapper(options = {}) {
+    const removeUi = Boolean(options.removeUi);
+    if (!state.active && !removeUi) return;
+    state.active = false;
+    clearSelection();
+    clearCleanup();
+    if (removeUi) {
+      teardownUi();
+      return;
+    }
+
+    showToast(t('zapper_toast_disabled', undefined, 'Element Zapper disabled.'));
+  }
+
+  function startRuleSyncLoop() {
+    if (ruleSyncIntervalId !== null) return;
+    if (window.top !== window) return;
+    ruleSyncIntervalId = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
+      if (ruleSyncInFlight) return;
+      ruleSyncInFlight = true;
+      browser.runtime.sendMessage({ action: 'wblock:zapper:broadcastReload' })
+        .catch(() => {})
+        .finally(() => {
+          ruleSyncInFlight = false;
+        });
+    }, RULE_SYNC_FALLBACK_INTERVAL_MS);
+    window.addEventListener('pagehide', () => {
+      if (ruleSyncIntervalId !== null) {
+        clearInterval(ruleSyncIntervalId);
+        ruleSyncIntervalId = null;
+      }
+    }, { once: true });
+  }
+
+  async function reloadRulesAndApply() {
+    state.inheritedRules = [];
+    state.host = safeHostname();
+    const cached = await loadSiteState(state.host);
+    state.rules = cached.rules;
+    state.rulesDisabled = cached.meta.disabled;
+    state.zapperPaused = cached.paused;
+    if (await migrateLegacyZapperRulesDisabled(state.host, state.rules, cached.legacyDisabled)) {
+      state.rulesDisabled = true;
+      await setSyncMeta(state.host, { disabled: true });
+    }
+    await applyRulesToPage(state.rules);
+
+    const nativeState = await fetchRulesFromNative(state.host);
+    if (nativeState && Array.isArray(nativeState.rules)) {
+      state.inheritedRules = nativeState.inheritedRules;
+      state.rulesDisabled = nativeState.disabled === true;
+      state.zapperPaused = nativeState.paused === true;
+      if (rulesSignature(nativeState.rules) !== rulesSignature(state.rules)) {
+        state.rules = nativeState.rules;
+      }
+      await applyRulesToPage(state.rules);
+    }
+    // A failed fetch keeps the cached rules as they are. Pending edits retry on the next successful fetch.
+  }
+
+  function reloadRulesAndApplyCoalesced() {
+    if (ruleReloadPromise) {
+      // A native invalidation racing an older read must not be swallowed. Fold
+      // any burst into exactly one follow-up pass after the current pass ends.
+      if (ruleReloadActive) ruleReloadPending = true;
+      return ruleReloadPromise;
+    }
+    // Start on the next microtask so same-tick invalidation bursts collapse into
+    // one pass before any native read has actually begun.
+    ruleReloadPromise = Promise.resolve().then(async () => {
+      ruleReloadActive = true;
+      do {
+        ruleReloadPending = false;
+        await reloadRulesAndApply();
+      } while (ruleReloadPending);
+    }).finally(() => {
+      ruleReloadActive = false;
+      ruleReloadPromise = null;
+    });
+    return ruleReloadPromise;
+  }
+
+  // iOS Safari keeps a frame alive while an extension event still holds its
+  // listener, so detach on pagehide or iframe-heavy pages run out of memory (#861).
+  const listenWhileShown = (event, listener) => {
+      event.addListener(listener);
+      window.addEventListener('pagehide', () => event.removeListener(listener));
+      window.addEventListener('pageshow', (e) => { if (e.persisted) event.addListener(listener); });
+  };
+  document.addEventListener('contextmenu', (event) => {
+    lastContextMenuTarget = event.target instanceof Element ? event.target : null;
+  }, true);
+  listenWhileShown(browser.runtime.onMessage, (message) => {
+    if (!message || typeof message !== 'object') return;
+
+    if (message.type === 'wblock:pageSupportProbe') {
+      return Promise.resolve({
+        ok: true,
+        host: safeHostname(),
+        protocol: typeof location !== 'undefined' ? location.protocol : '',
+      });
+    }
+    if (message.type === 'wblock:zapper:activate') {
+      // Activation may reach every frame of the tab. Only the top frame builds
+      // the panel; a context-menu activation targets the frame that was clicked.
+      if (message.fromContextMenu !== true && window.top !== window) return;
+      return activateZapper({
+        fromContextMenu: message.fromContextMenu === true,
+      }).then((activated) => ({
+        ok: activated !== false,
+        handledBy: 'zapper-content'
+      }));
+    }
+    if (message.type === 'wblock:zapper:deactivate') {
+      deactivateZapper({ removeUi: true });
+      return Promise.resolve({ ok: true, handledBy: 'zapper-content' });
+    }
+    if (message.type === 'wblock:zapper:reloadRules') {
+      return reloadRulesAndApplyCoalesced()
+        .then(() => ({ ok: true, handledBy: 'zapper-content' }))
+        .catch(() => ({ ok: false, handledBy: 'zapper-content' }));
+    }
+  });
+
+  // Initial load: apply existing rules for this host. Parent-domain (inherited)
+  // rules still need the lookup even when this host has none. The fallback poll
+  // starts only when rules apply here; activation starts it otherwise.
+  reloadRulesAndApplyCoalesced().then(() => {
+    if (state.rules.length > 0 || state.inheritedRules.length > 0) startRuleSyncLoop();
+  }).catch(() => {});
+})();

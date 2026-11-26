@@ -92,7 +92,7 @@ check_grep() {
   local label="$1"
   local pattern="$2"
   local file="$3"
-  if grep -q "${pattern}" "${file}"; then
+  if perl -0777 -e 'my ($p, $f) = @ARGV; open my $fh, "<", $f or exit 1; local $/; my $s = <$fh>; $s =~ s/\\\n//g; exit(index($s, $p) >= 0 ? 0 : 1)' -- "${pattern}" "${file}"; then
     success "${label}: found in $(basename "${file}")"
   else
     error "${label}: NOT found in $(basename "${file}")"
@@ -116,6 +116,8 @@ minify_one "${SRC_DIR}/background.js" "background"
 minify_one "${SRC_DIR}/content.js" "content"
 minify_one "${SRC_DIR}/no-autoplay-gate.js" "no-autoplay-gate"
 minify_one "${ENGINE_JS_DIR}/procedural.js" "procedural"
+minify_one "${SRC_DIR}/userscript-injector.js" "userscript-injector"
+minify_one "${SRC_DIR}/zapper-content.js" "zapper-content"
 
 # One file per uBO scriptlet, generated from the engine's resources.
 info "Generating scriptlets/ (Packages/wblock-engine/resources/resources.json)..."
@@ -153,6 +155,14 @@ check_grep "procedural API use" "wbeProcedural" "${RES_DIR}/background.js"
 # background.js loads scriptlets/adguard.js on demand; the library itself must stay out of it.
 check_absent "bundled AdGuard runtime" "ExtendedCss|scriptletsMap" "${RES_DIR}/background.js"
 check_absent "retired AdGuard runtime" "adguard|ExtendedCss|getScriptletFunction|scriptletsMap" "${RES_DIR}/content.js"
+check_grep "userscript run guard" "wBlockUserscriptInjectorHasRun" "${RES_DIR}/userscript-injector.js"
+check_grep "userscript menu bridge" "__wBlockMenuCommandBridge" "${RES_DIR}/userscript-injector.js"
+check_grep "userscript frame init handoff" "__wblockFrameInitialization" "${RES_DIR}/userscript-injector.js"
+check_grep "userscript page support probe" "wblock:pageSupportProbe" "${RES_DIR}/userscript-injector.js"
+check_grep "zapper load guard" "__wblockZapperLoaded" "${RES_DIR}/zapper-content.js"
+check_grep "zapper frame init handoff" "__wblockZapperInitialization" "${RES_DIR}/zapper-content.js"
+check_grep "zapper handler tag" "zapper-content" "${RES_DIR}/zapper-content.js"
+check_grep "zapper activate message" "wblock:zapper:activate" "${RES_DIR}/zapper-content.js"
 
 if [[ "${FAIL}" -ne 0 ]]; then
   error "Minification verification failed."
