@@ -115,7 +115,17 @@ public enum WebExtensionRequestHandler {
     @MainActor private static let userScriptPreparedPayloadCache = UserScriptPreparedPayloadCache()
     #if DEBUG
     @MainActor static var userScriptManagerOverrideForTesting: UserScriptManager?
+    nonisolated(unsafe) static var pauseGroupIdentifierOverrideForTesting: String?
     #endif
+
+    private static var pauseGroupIdentifier: String {
+        #if DEBUG
+        if let override = pauseGroupIdentifierOverrideForTesting {
+            return override
+        }
+        #endif
+        return GroupIdentifier.shared.value
+    }
 
     @MainActor
     private static var activeUserScriptManager: UserScriptManager {
@@ -356,7 +366,8 @@ public enum WebExtensionRequestHandler {
             if let url = URL(string: urlString) {
                 // Respect the filter pause and per-site disable immediately for advanced rules.
                 Task { @MainActor in
-                    let paused = BlockingPauseStore.isPaused(.filters)
+                    let paused = BlockingPauseStore.isPaused(.filters, groupIdentifier: pauseGroupIdentifier)
+                    var didRefreshProtobufData = false
                     if paused {
                         message?["payload"] = emptyRulesPayload(disabled: false, paused: true)
                     } else {
@@ -374,6 +385,7 @@ public enum WebExtensionRequestHandler {
                         // native if-domain rule and uBO's per-site switch, it
                         // covers the site's frames too.
                         let disabledSites = await currentFilterDisabledSites()
+                        didRefreshProtobufData = true
                         let site = topURL ?? url
                         let disabled = HostMatcher.isHostDisabled(host: site.host ?? "", disabledSites: disabledSites)
                         if disabled {
@@ -391,8 +403,15 @@ public enum WebExtensionRequestHandler {
                         }
                     }
 
+                    if message?["includeUserScripts"] as? Bool == true || message?["includeZapper"] as? Bool == true,
+                       let host = url.host, !host.isEmpty {
+                        if didRefreshProtobufData {
+                            message?["zapper"] = zapperRulesSnapshot(hostname: host, manager: ProtobufDataManager.shared)
+                        } else {
+                            message?["zapper"] = await getZapperRules(hostname: host)
+                        }
+                    }
                     if message?["includeUserScripts"] as? Bool == true, let request = message {
-                        message?["zapper"] = await getZapperRules(hostname: url.host ?? "")
                         let scripts = await getUserScripts(message: request)
                         message?["userScripts"] = scripts["userScripts"] ?? []
                         message?["userScriptsError"] = scripts["error"] ?? nil
@@ -811,12 +830,33 @@ public enum WebExtensionRequestHandler {
     private static func handleGetBlockingState(message: [String: Any?], context: NSExtensionContext) {
         let host = (message["host"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         Task { @MainActor in
-            let paused = BlockingPauseStore.isPaused(.filters)
+            let pausedComponents = BlockingPauseStore.pausedComponents(groupIdentifier: pauseGroupIdentifier)
+            let paused = pausedComponents.contains(.filters)
+            let anyPaused = !pausedComponents.isEmpty
+            if host.isEmpty {
+                let response = createResponse(with: [
+                    "disabled": false,
+                    "paused": paused,
+                    "anyPaused": anyPaused
+                ])
+                context.completeRequest(returningItems: [response])
+                return
+            }
             // Mirrors the advanced-rules gate above: filter-only sites report disabled
             // here so cached configurations are not replayed on them.
             let disabledSites = await currentFilterDisabledSites()
-            let disabled = !host.isEmpty && HostMatcher.isHostDisabled(host: host, disabledSites: disabledSites)
-            let response = createResponse(with: ["disabled": disabled, "paused": paused])
+            let disabled = HostMatcher.isHostDisabled(host: host, disabledSites: disabledSites)
+            let zapper = zapperRulesSnapshot(
+                hostname: host,
+                manager: ProtobufDataManager.shared,
+                isPaused: pausedComponents.contains(.elementZapper)
+            )
+            let response = createResponse(with: [
+                "disabled": disabled,
+                "paused": paused,
+                "anyPaused": anyPaused,
+                "zapper": zapper
+            ])
             context.completeRequest(returningItems: [response])
         }
     }
@@ -1910,17 +1950,29 @@ public enum WebExtensionRequestHandler {
     }
 
     @MainActor
+    private static func zapperRulesSnapshot(
+        hostname: String,
+        manager: ProtobufDataManager,
+        isPaused: Bool? = nil
+    ) -> [String: Any?] {
+        [
+            "ok": true,
+            "rules": manager.getZapperRules(forHost: hostname),
+            "inheritedRules": manager.getInheritedZapperRules(forHost: hostname),
+            // The site switch and the global pause stay separate. Folding the pause
+            // into `disabled` made the popup and page cache read the site as off
+            // after a resume committed between two native reads.
+            "disabled": manager.isZapperDisabled(forHost: hostname),
+            "paused": isPaused ?? BlockingPauseStore.isPaused(.elementZapper, groupIdentifier: pauseGroupIdentifier)
+        ]
+    }
+
+    @MainActor
     private static func getZapperRules(hostname: String) async -> [String: Any?] {
         let manager = ProtobufDataManager.shared
         await manager.waitUntilLoaded()
         _ = await manager.refreshFromDiskIfModified()
-        return ["ok": true, "rules": manager.getZapperRules(forHost: hostname),
-                "inheritedRules": manager.getInheritedZapperRules(forHost: hostname),
-                // The site switch and the global pause stay separate. Folding the pause
-                // into `disabled` made the popup and page cache read the site as off
-                // after a resume committed between two native reads.
-                "disabled": manager.isZapperDisabled(forHost: hostname),
-                "paused": BlockingPauseStore.isPaused(.elementZapper)]
+        return zapperRulesSnapshot(hostname: hostname, manager: manager)
     }
 
     private static func handleSetSiteZapperDisabled(message: [String: Any?], context: NSExtensionContext) {

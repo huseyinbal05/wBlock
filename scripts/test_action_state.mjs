@@ -20,8 +20,10 @@ for (const file of ['extension-src/background.js', 'wBlock Scripts (iOS)/Resourc
     { id: 3, active: false, url: 'https://background.example/' }
   ];
   let actionLookups = 0;
+  let pausedLookups = 0;
   const disabledHosts = new Set();
   let paused = false;
+  let anyPaused = false;
   let nativeDelayMs = 0;
   const states = new Map();
   const state = id => {
@@ -36,9 +38,10 @@ for (const file of ['extension-src/background.js', 'wBlock Scripts (iOS)/Resourc
         if (nativeDelayMs && (message.action === 'getBlockingPausedState' || message.action === 'getBlockingState')) {
           await new Promise(resolve => setTimeout(resolve, nativeDelayMs));
         }
+        if (message.action === 'getBlockingPausedState') pausedLookups++;
         if (message.action === 'getBlockingPausedState' || message.action === 'getBlockingState') actionLookups++;
-        if (message.action === 'getBlockingPausedState') return { paused };
-        if (message.action === 'getBlockingState') return { disabled: disabledHosts.has(message.host), paused: false };
+        if (message.action === 'getBlockingPausedState') return { paused: paused || anyPaused };
+        if (message.action === 'getBlockingState') return { disabled: disabledHosts.has(message.host), paused, anyPaused: paused || anyPaused };
         if (message.action === 'getRemoveParamDNRRules') return { ok: true, version: 'test', rules: [], count: 0 };
         return { ok: true, payload: { css: [], procedural: [], scriptlets: [], engineTimestamp: 1 } };
       }
@@ -86,7 +89,8 @@ for (const file of ['extension-src/background.js', 'wBlock Scripts (iOS)/Resourc
   for (const listener of browser.tabs.onUpdated.listeners) listener(3, { status: 'complete' }, tabs[2]);
   await settle();
   assert.deepEqual(state(3), {}, 'background tabs must not sync');
-  assert.equal(actionLookups, 4, 'only active tabs cost native lookups');
+  assert.equal(actionLookups, 2, 'one native lookup per active tab');
+  assert.equal(pausedLookups, 0, 'syncActionStateForTab uses getBlockingState without separate getBlockingPausedState');
   // Safari's tabs.get can report the tab inactive inside onActivated.
   for (const listener of browser.tabs.onActivated.listeners) await listener({ tabId: 3 });
   check(3, false);
@@ -100,6 +104,12 @@ for (const file of ['extension-src/background.js', 'wBlock Scripts (iOS)/Resourc
   check(2, true, true, 'Paused');
   assert.equal(state(2).badge, 'II');
   paused = false;
+  anyPaused = true;
+  await refresh();
+  check(1, true, true, 'Paused');
+  check(2, true, true, 'Paused');
+  assert.equal(state(2).badge, 'II');
+  anyPaused = false;
   await refresh();
   check(1, true, true, 'Disabled');
   check(2, false);

@@ -782,6 +782,25 @@ for (const source of [canonicalSource, bundleSource]) {
       && hashQuery.cleanUrl === "https://docs.example/path#?utm=1"
       && cleanState.nativeMessages.filter(m => m.action === "getCleanPageURL").length === beforeClean);
 
+  const zapperObj = { ok: true, rules: [".zapped"], inheritedRules: [], disabled: false, paused: false };
+  const zapperState = loadBackground({
+    source,
+    nativeHandler: message => {
+      if (message.action === "getBlockingState") {
+        return { disabled: false, paused: false, anyPaused: false, zapper: { ...zapperObj, rules: [".zapped-recheck"] } };
+      }
+      return { payload: makeConfig(["#ad"], 10), zapper: zapperObj };
+    }
+  });
+  await sleep(20);
+  const missReply = await zapperState.onMessage({ type: "InitContentScript" }, topFrameSender("https://zap.example/"));
+  check("top-frame InitContentScript miss returns zapper", JSON.stringify(missReply.zapper) === JSON.stringify(zapperObj));
+  const nativeBeforeFresh = zapperState.nativeMessages.length;
+  const freshReply = await zapperState.onMessage({ type: "InitContentScript" }, topFrameSender("https://zap.example/"));
+  check("fresh top-frame InitContentScript returns zapper with 0 native calls",
+    JSON.stringify(freshReply.zapper) === JSON.stringify(zapperObj)
+      && zapperState.nativeMessages.length === nativeBeforeFresh);
+
   // Persist dirty-check: warmup with unchanged engineTimestamp and subframe lookups do not write storage.
   let diskWrites = 0;
   const dirtyState = loadBackground({
@@ -793,7 +812,12 @@ for (const source of [canonicalSource, bundleSource]) {
         entries: [["https://steady.example/#", makeConfig(["#steady"], 55)]]
       }
     },
-    nativeHandler: () => ({ payload: makeConfig(["#steady"], 55) }),
+    nativeHandler: message => {
+      if (message.action === "getBlockingState") {
+        return { disabled: false, paused: false, zapper: { ...zapperObj, rules: [".zapped-recheck"] } };
+      }
+      return { payload: makeConfig(["#steady"], 55) };
+    },
     storageSet: items => {
       if (Object.hasOwn(items, CACHE_KEY)) diskWrites += 1;
     }
@@ -803,8 +827,9 @@ for (const source of [canonicalSource, bundleSource]) {
   await dirtyState.onMessage({ type: "InitContentScript" }, frameSender("https://frame.example/sub", "https://steady.example/"));
   await sleep(1150);
   check("subframe lookup skips disk persist", diskWrites === 0);
-  await dirtyState.onMessage({ type: "InitContentScript" }, topFrameSender("https://steady.example/"));
+  const nonFreshReply = await dirtyState.onMessage({ type: "InitContentScript" }, topFrameSender("https://steady.example/"));
   await sleep(1150);
+  check("non-fresh cache hit gets zapper from getBlockingState", nonFreshReply.zapper?.rules?.[0] === ".zapped-recheck");
   check("unchanged top-frame revalidation skips disk persist", diskWrites === 0);
 
   // In-flight storage write race: a newer top-frame config arriving while an

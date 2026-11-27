@@ -485,8 +485,29 @@
   // The same window covers per-frame state reads (site state, No Autoplay,
   // zapper rules, userscripts): identical reads share one native answer.
   const CONFIG_REVALIDATE_INTERVAL_MS = 5000;
+  const RECENT_NATIVE_READ_LIMIT = 128;
   const configValidatedAt = new Map();
   const recentNativeReads = new Map();
+  const recentZapperByHost = new Map();
+  const normalizeSiteDisabledHost = host => typeof host === "string"
+    ? host.trim().toLowerCase()
+    : "";
+  const cacheRecentZapper = (host, zapper) => {
+    const normalized = normalizeSiteDisabledHost(host);
+    if (!normalized || !zapper || typeof zapper !== "object") return;
+    recentZapperByHost.delete(normalized);
+    recentZapperByHost.set(normalized, { zapper, at: Date.now() });
+    if (recentZapperByHost.size > RECENT_NATIVE_READ_LIMIT) {
+      recentZapperByHost.delete(recentZapperByHost.keys().next().value);
+    }
+  };
+  const getRecentZapper = host => {
+    const normalized = normalizeSiteDisabledHost(host);
+    if (!normalized) return undefined;
+    const hit = recentZapperByHost.get(normalized);
+    if (hit && Date.now() - hit.at < CONFIG_REVALIDATE_INTERVAL_MS) return hit.zapper;
+    return undefined;
+  };
   const isConfigFresh = key => Date.now() - (configValidatedAt.get(key) || 0) < CONFIG_REVALIDATE_INTERVAL_MS;
   // A lookup that was in flight when state changed must not start a window.
   let nativeStateEpoch = 0;
@@ -494,6 +515,7 @@
     nativeStateEpoch += 1;
     configValidatedAt.clear();
     recentNativeReads.clear();
+    recentZapperByHost.clear();
   };
   // Mutations end the window when sent and again when done, so reads that
   // overlapped them are not shared either.
@@ -503,7 +525,6 @@
     Promise.resolve(response).finally(forgetRecentNativeState).catch(() => {});
     return response;
   };
-  const RECENT_NATIVE_READ_LIMIT = 128;
   const readNativeRecently = (request, send = sendPriorityNativeMessage, shareable = () => true) => {
     const key = JSON.stringify(request);
     const hit = recentNativeReads.get(key);
@@ -647,6 +668,8 @@
     if (request.includeUserScripts && message) {
       request.userScripts = message.userScripts;
       request.userScriptsError = message.userScriptsError;
+    }
+    if ((request.includeUserScripts || request.includeZapper) && message && message.zapper) {
       request.zapper = message.zapper;
     }
     if (message && message.state === "error") {
@@ -680,7 +703,14 @@
       // Drop obsolete persisted rules immediately even if an iframe sees the new timestamp first.
       void clearPersistedConfigCache();
     }
-    if (fresh) configValidatedAt.set(key, Date.now());
+    if (fresh) {
+      configValidatedAt.set(key, Date.now());
+      if (message.zapper) {
+        try {
+          cacheRecentZapper(new URL(url).hostname, message.zapper);
+        } catch {}
+      }
+    }
     // Save the new message in the cache for the given URL. Delete the key
     // first so Map insertion order doubles as LRU order for the persisted
     // slice.
@@ -743,15 +773,21 @@
     const key = cacheKey(url, topUrl);
     const pending = pendingConfigurationRequests.get(key);
     if (pending) {
-      return pending;
+      return pending.promise.then(configuration => {
+        if (request.includeZapper && !request.zapper && pending.request.zapper) {
+          request.zapper = pending.request.zapper;
+        }
+        return configuration;
+      });
     }
-    const requestPromise = requestConfiguration(request, url, topUrl).finally(() => {
-      if (pendingConfigurationRequests.get(key) === requestPromise) {
+    const entry = { request, promise: null };
+    entry.promise = requestConfiguration(request, url, topUrl).finally(() => {
+      if (pendingConfigurationRequests.get(key) === entry) {
         pendingConfigurationRequests.delete(key);
       }
     });
-    pendingConfigurationRequests.set(key, requestPromise);
-    return requestPromise;
+    pendingConfigurationRequests.set(key, entry);
+    return entry.promise;
   };
   const getConfiguration = async (message, url, topUrl, authoritative = false) => {
     // Userscript replies need a native answer even when rules are cached. Carry
@@ -786,9 +822,10 @@
     disabled,
     paused
   });
-  const frameLookupMessage = (sender, includeUserScripts) => ({
+  const frameLookupMessage = (sender, includeUserScripts, includeZapper = /^https?:\/\//.test(sender.url || '')) => ({
     type: MessageType.InitContentScript,
     includeUserScripts,
+    includeZapper,
     url: sender.url,
     isTopFrame: sender.frameId === 0,
     includeContent: true,
@@ -824,9 +861,17 @@
     const { configuration: cachedConfiguration, fromCache, fresh } = configurationResult;
     let configuration = cachedConfiguration;
     let cachedBlockingState = null;
+    let frameHost = "";
+    try {
+      frameHost = normalizeSiteDisabledHost(new URL(url).hostname);
+    } catch {}
+    let zapperResponse = message.zapper;
     if (fresh) {
       cachedBlockingState = { disabled: false, paused: false };
       configuration = { ...cachedConfiguration, disabled: false, paused: false };
+      if (message.includeZapper && !zapperResponse) {
+        zapperResponse = getRecentZapper(frameHost);
+      }
     } else if (fromCache) {
       // Site state covers the whole tab, as native if-domain rules do.
       let host = "";
@@ -834,11 +879,18 @@
         host = new URL(topUrl ?? url).hostname;
       } catch {}
       try {
+        const epoch = nativeStateEpoch;
         const state = await requestBlockingState(host);
         if (!state || typeof state.disabled !== "boolean" || typeof state.paused !== "boolean") {
           throw new Error("Invalid blocking state from native host");
         }
-        cachedBlockingState = state;
+        cachedBlockingState = { disabled: state.disabled, paused: state.paused };
+        if (message.includeZapper && state.zapper && frameHost === normalizeSiteDisabledHost(host)) {
+          zapperResponse = state.zapper;
+          if (epoch === nativeStateEpoch && !state.disabled && !state.paused) {
+            cacheRecentZapper(frameHost, state.zapper);
+          }
+        }
       } catch (error) {
         const errorMessage = String(error && error.message ? error.message : error);
         logError('[wBlock] Cached configuration state lookup failed for ', url, errorMessage);
@@ -865,7 +917,8 @@
     // it is replaced with the result of the priority state lookup above.
     const response = {
       type: MessageType.InitContentScript,
-      ...(message.includeUserScripts ? { userScripts: message.userScripts, userScriptsError: message.userScriptsError, zapper: message.zapper } : {}),
+      ...(message.includeUserScripts ? { userScripts: message.userScripts, userScriptsError: message.userScriptsError } : {}),
+      ...(zapperResponse ? { zapper: zapperResponse } : {}),
       ...(fromCache
         ? cachedBlockingState
         : typeof configuration.disabled === "boolean"
@@ -888,7 +941,7 @@
       return { restored: false, state: "invalid" };
     }
     const topUrl = frameId === 0 ? undefined : sender.tab.url;
-    const resolved = await resolveFrameConfiguration(frameLookupMessage(sender, false), url, topUrl, true);
+    const resolved = await resolveFrameConfiguration(frameLookupMessage(sender, false, false), url, topUrl, true);
     if (resolved.error) return { restored: false, state: "error", error: resolved.error };
     const { configuration } = resolved;
     if (configuration.disabled === true || configuration.paused === true) return { restored: false, state: "inactive" };
@@ -1147,9 +1200,6 @@
     if (!sentDone) await sendGMPortMessage(sender, portName, "[DONE]");
     return { responseLength, sentDone: true };
   };
-  const normalizeSiteDisabledHost = host => typeof host === "string"
-    ? host.trim().toLowerCase()
-    : "";
   // Zapper activation and action state cannot wait behind background updates.
   // The app can change these without telling Safari (iOS), so frames share
   // only a read still in flight, never a settled answer.
@@ -1802,8 +1852,9 @@
     const tabId = ((_sender$tab = sender.tab) === null || _sender$tab === void 0 ? void 0 : _sender$tab.id) ?? 0;
     const frameId = sender.frameId ?? 0;
     // Only browser-supplied frame identity can authorize startup userscripts.
-    const lookup = frameLookupMessage(sender, request.includeUserScripts === true && Number.isSafeInteger(sender.frameId)
-      && sender.frameId >= 0 && /^https?:\/\//.test(sender.url || ''));
+    const isHttpFrame = Number.isSafeInteger(sender.frameId)
+      && sender.frameId >= 0 && /^https?:\/\//.test(sender.url || '');
+    const lookup = frameLookupMessage(sender, request.includeUserScripts === true && isHttpFrame, isHttpFrame);
     let blankFrame = false;
     let url = sender.url || '';
     const topUrl = frameId === 0 ? undefined : (_sender$tab2 = sender.tab) === null || _sender$tab2 === void 0 ? void 0 : _sender$tab2.url;
@@ -2069,31 +2120,20 @@
     }
     return extensionName;
   };
-  const getBlockingPausedForAction = async () => {
-    try {
-      const response = await sendQueuedNativeMessage({
-        action: "getBlockingPausedState"
-      });
-      return Boolean(response && response.paused);
-    } catch (error) {
-      console.warn("[wBlock] Failed to resolve global pause state:", error);
-      return false;
-    }
-  };
   // Content Filtering off for the site slashes the W. getBlockingState reads
   // the filter-only list plus the master whitelist, the same state the popup
-  // switch shows; getSiteDisabledState only reads the master list.
-  const getSiteDisabledForAction = async host => {
-    const normalizedHost = normalizeSiteDisabledHost(host);
-    if (!normalizedHost) {
-      return false;
-    }
+  // switch shows, along with anyPaused for the toolbar paused indicator.
+  const getActionBlockingState = async host => {
     try {
-      const response = await requestBlockingState(normalizedHost);
-      return Boolean(response && response.disabled);
+      const response = await requestBlockingState(host || "");
+      const blockingPaused = Boolean(
+        typeof response?.anyPaused === "boolean" ? response.anyPaused : response?.paused
+      );
+      const siteDisabled = !blockingPaused && Boolean(response?.disabled);
+      return { blockingPaused, siteDisabled };
     } catch (error) {
-      console.warn("[wBlock] Failed to resolve action disabled state:", error);
-      return false;
+      console.warn("[wBlock] Failed to resolve action blocking state:", error);
+      return { blockingPaused: false, siteDisabled: false };
     }
   };
   // Only the active tab shows the action; the rest sync through onActivated.
@@ -2109,8 +2149,9 @@
     actionSyncGenerationByTab.set(tab.id, generation);
     const support = await resolveTabSupport(tab);
     const supported = support.supported;
-    const blockingPaused = supported ? await getBlockingPausedForAction() : false;
-    const siteDisabled = supported && !blockingPaused ? await getSiteDisabledForAction(support.host || "") : false;
+    const { blockingPaused, siteDisabled } = supported
+      ? await getActionBlockingState(support.host || "")
+      : { blockingPaused: false, siteDisabled: false };
     if (actionSyncGenerationByTab.get(tab.id) !== generation) {
       return;
     }

@@ -187,13 +187,15 @@
     };
     // A failed lookup (native timeout, background waking up) is not a
     // disabled site; retry it so the document still gets its rules.
+    const sendInitAttempt = () => browser.runtime.sendMessage(message).catch(error => ({
+      type: MessageType.InitContentScript,
+      state: "error",
+      error: String(error && error.message ? error.message : error)
+    }));
+    const firstAttemptPromise = sendInitAttempt();
     const requestInitialization = async () => {
       for (let attempt = 0; ; attempt += 1) {
-        const response = await browser.runtime.sendMessage(message).catch(error => ({
-          type: MessageType.InitContentScript,
-          state: "error",
-          error: String(error && error.message ? error.message : error)
-        }));
+        const response = attempt === 0 ? await firstAttemptPromise : await sendInitAttempt();
         if (!(response && response.state === "error")
           || attempt >= INIT_RETRY_DELAYS_MS.length
           || isCloudflareChallenge()) {
@@ -207,7 +209,14 @@
     // request fresh userscripts independently of content-filter initialization.
     if (message.includeUserScripts) {
       globalThis.__wblockFrameInitialization = configPromise;
-      globalThis.__wblockZapperInitialization = configPromise.then(response => response?.zapper);
+    }
+    if (/^https?:$/.test(location.protocol) || /^https?:/i.test(location.href || '')) {
+      // Only wait for the first initialization attempt so filter init retries
+      // never hold up Zapper's own fallback lookup.
+      globalThis.__wblockZapperInitialization = firstAttemptPromise.then(
+        response => (response && response.state !== "error" ? response.zapper : undefined),
+        () => undefined
+      );
     }
     initializationStatePromise = configPromise.then(stateFromInitResponse);
     const response = await configPromise;

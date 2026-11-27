@@ -325,7 +325,7 @@ try {
         sendMessage(message) {
           cleanCalls.push(message);
           if (message.type === "InitContentScript") {
-            return Promise.resolve({ type: "InitContentScript", disabled: false, paused: false, payload: { css: [], procedural: [], scriptlets: [] } });
+            return Promise.resolve({ type: "InitContentScript", disabled: false, paused: false, zapper: { ok: true, rules: [".z"] }, payload: { css: [], procedural: [], scriptlets: [] } });
           }
           return Promise.resolve({ ok: true, cleanUrl: message.url });
         },
@@ -335,8 +335,14 @@ try {
     const noQueryWin = { ...raceWindow, location: noQueryLoc };
     noQueryWin.top = noQueryWin;
     await withGlobals({ ...frameGlobals(raceDoc), location: noQueryLoc }, async () => {
+      delete globalThis.__wblockZapperInitialization;
       new Function("browser", "window", "self", source)(noQueryBrowser, noQueryWin, noQueryWin);
       await new Promise(resolve => setTimeout(resolve, 20));
+      check(
+        "top-frame HTTP(S) page shares __wblockZapperInitialization",
+        globalThis.__wblockZapperInitialization !== undefined && (await globalThis.__wblockZapperInitialization)?.rules?.[0] === ".z"
+      );
+      delete globalThis.__wblockZapperInitialization;
     });
     check(
       "query-less top-frame URL skips wblock:getCleanURL",
@@ -670,6 +676,58 @@ try {
   });
   check("failed scriptlet handoff retries until acknowledged", requests.length === 2);
   check("scriptlet retry excludes already successful calls", JSON.stringify(requests[1]) === JSON.stringify([calls[1]]));
+}
+
+// Rejected InitContentScript must resolve __wblockZapperInitialization to undefined instead of rejecting.
+{
+  const location = { href: "https://example.com/", hostname: "example.com", protocol: "https:" };
+  const win = { ...windowStub, location };
+  win.top = win;
+  let zapperInitResult = "unset";
+  try {
+    await withGlobals({ ...frameGlobals(documentStub), location }, async () => {
+      new Function("browser", "window", "self", source)({ runtime: {
+        onMessage: { addListener() {} },
+        sendMessage: async message => {
+          if (message.type === "InitContentScript") throw new Error("transient init failure");
+          return {};
+        }
+      } }, win, win);
+      zapperInitResult = await globalThis.__wblockZapperInitialization;
+    });
+  } finally {
+    delete globalThis.__wblockZapperInitialization;
+  }
+  check("__wblockZapperInitialization resolves to undefined when InitContentScript rejects", zapperInitResult === undefined);
+}
+
+// Erroring first InitContentScript attempt must let Zapper fall back immediately
+// without waiting for INIT_RETRY_DELAYS_MS.
+{
+  const location = { href: "https://example.com/", hostname: "example.com", protocol: "https:" };
+  const win = { ...windowStub, location };
+  win.top = win;
+  let zapperInitResult = "unset";
+  let initCalls = 0;
+  try {
+    await withGlobals({ ...frameGlobals(documentStub), location }, async () => {
+      new Function("browser", "window", "self", source)({ runtime: {
+        onMessage: { addListener() {} },
+        sendMessage: message => {
+          if (message.type === "InitContentScript") {
+            initCalls += 1;
+            return Promise.resolve({ type: "InitContentScript", state: "error", error: "transient" });
+          }
+          return Promise.resolve({});
+        }
+      } }, win, win);
+      zapperInitResult = await globalThis.__wblockZapperInitialization;
+    });
+  } finally {
+    delete globalThis.__wblockZapperInitialization;
+  }
+  check("__wblockZapperInitialization resolves to undefined after first erroring attempt without waiting for retries",
+    zapperInitResult === undefined && initCalls === 1);
 }
 
 if (failures > 0) {
