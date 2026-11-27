@@ -11,6 +11,15 @@
 (() => {
   'use strict';
 
+  if (globalThis.wbeProcedural) {
+    const pending = globalThis.__wbePendingProcedural;
+    if (pending) {
+      delete globalThis.__wbePendingProcedural;
+      try { globalThis.wbeProcedural.apply(pending); } catch {}
+    }
+    return null;
+  }
+
   const DEFAULT_STYLE = 'display: none !important';
   const PSEUDO_ELEMENT = /::?(?:before|after|marker|placeholder|selection|first-line|first-letter|backdrop|file-selector-button)$/i;
   const BAD_STYLE = /image-set\(|url\(|expression|\\|\/\s*\/|\/\*|[{}<>]/i;
@@ -516,5 +525,10 @@
   };
 
   globalThis.wbeProcedural = { apply };
+  const pending = globalThis.__wbePendingProcedural;
+  if (pending) {
+    delete globalThis.__wbePendingProcedural;
+    try { apply(pending); } catch {}
+  }
   return null;
 })();

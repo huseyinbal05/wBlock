@@ -812,4 +812,21 @@ describe('compatibility gates', () => {
     await sleep(150);
     assert.equal(button.hasAttribute('disabled'), false);
   });
+
+  test('consumes __wbePendingProcedural on initial load and subsequent load', () => {
+    const dom = new JSDOM('<div id="a" class="ad"></div><div id="b" class="ad2"></div>', {
+      url: 'https://example.com/',
+      runScripts: 'outside-only',
+      pretendToBeVisual: true,
+    });
+    dom.window.__wbePendingProcedural = [filt([op('css-selector', '.ad')])];
+    dom.window.eval(SRC);
+    assert.equal(dom.window.__wbePendingProcedural, undefined);
+    assert.equal(isHidden(dom.window, dom.window.document.getElementById('a')), true);
+
+    dom.window.__wbePendingProcedural = [filt([op('css-selector', '.ad2')])];
+    dom.window.eval(SRC);
+    assert.equal(dom.window.__wbePendingProcedural, undefined);
+    assert.equal(isHidden(dom.window, dom.window.document.getElementById('b')), true);
+  });
 });

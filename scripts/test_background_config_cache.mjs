@@ -608,23 +608,32 @@ for (const message of [
   );
 }
 
-// A failed file must remain retryable without replaying completed scriptlets.
+// A failed file must remain retryable without replaying completed scriptlets,
+// while independent scriptlet files dispatch in parallel.
 {
   const scriptlets = [["set-constant", "probe", "1"], ["prevent-fetch", "adsbygoogle"]];
   const page = vm.createContext({});
   const installed = [];
-  let firstCompleted = false;
-  let secondStartedAfterFirst;
+  const dispatchedFiles = [];
+  let releaseFirst;
+  const firstHold = new Promise(resolve => { releaseFirst = resolve; });
+  let firstPending = false;
+  let secondStartedWhileFirstPending = false;
   let unavailable = true;
   const state = loadBackground({
     nativeHandler: () => ({ payload: makeConfig([], 19, [], scriptlets) }),
     executeScript: async injection => {
       if (injection.func) vm.runInContext(`(${injection.func})(...${JSON.stringify(injection.args)})`, page);
+      for (const file of injection.files || []) dispatchedFiles.push(file);
       if (injection.files?.includes("scriptlets/set-constant.js")) {
-        await sleep(5);
-        firstCompleted = true;
+        firstPending = true;
+        await firstHold;
+        firstPending = false;
       }
-      if (injection.files?.includes("scriptlets/prevent-fetch.js")) secondStartedAfterFirst ??= firstCompleted;
+      if (injection.files?.includes("scriptlets/prevent-fetch.js")) {
+        if (firstPending) secondStartedWhileFirstPending = true;
+        releaseFirst();
+      }
       if (unavailable && injection.files?.includes("scriptlets/prevent-fetch.js")) {
         return [{ error: "Script execution target not found" }];
       }
@@ -638,7 +647,9 @@ for (const message of [
   });
   const sender = topFrameSender("https://injection.example/");
   const response = await state.onMessage({ type: "InitContentScript" }, sender);
-  check("scriptlet files retain their execution order", secondStartedAfterFirst === true);
+  check("scriptlet files dispatch in order and in parallel",
+    secondStartedWhileFirstPending === true
+      && JSON.stringify(dispatchedFiles) === JSON.stringify(["scriptlets/set-constant.js", "scriptlets/prevent-fetch.js"]));
   check("normal frame hands back only failed scriptlets", JSON.stringify(response?.payload?.scriptlets) === JSON.stringify([scriptlets[1]]));
   const failed = await state.onMessage({ action: "wblock:injectScriptlets", scriptlets: [scriptlets[1]] }, sender);
   check("failed scriptlet execution is not acknowledged", failed?.injected === false && JSON.stringify(failed.failedScriptlets) === JSON.stringify([scriptlets[1]]));
@@ -714,6 +725,39 @@ for (const message of [
   const procedural = loadedState.executed.filter(injection => injection.args && injection.args[0] && injection.args[0][0] === '{"selector":[{"type":"css","arg":"div"}]}');
   check("loaded procedural.js is not injected again", !loadedState.executed.some(injection => injection.files && injection.files[0] === "procedural.js"));
   check("loaded procedural.js applies filters in one call", procedural.length === 1);
+
+  // Cold procedural filters: ISOLATED takes at most 2 calls (never 3), and MAIN
+  // dispatches func + procedural.js in parallel (1 round-trip, 2 calls total).
+  const coldIsolated = loadBackground({
+    nativeHandler: () => ({ payload: makeConfig([], 19, ['{"selector":[{"type":"css","arg":"div"}]}']) }),
+    executeScript: async () => [{ result: false }]
+  });
+  await coldIsolated.onMessage({ type: "InitContentScript" }, topFrameSender(pageUrl));
+  check("unloaded ISOLATED procedural filter takes 2 executeScript calls (not 3)", coldIsolated.executed.length === 2);
+
+  let holdMainFunc;
+  const mainFuncHold = new Promise(resolve => { holdMainFunc = resolve; });
+  let mainFileStartedWhileFuncPending = false;
+  let mainFuncPending = false;
+  const coldMain = loadBackground({
+    nativeHandler: () => ({ payload: makeConfig([], 19, [propertyRule]) }),
+    executeScript: async injection => {
+      if (injection.world === "MAIN" && typeof injection.func === "function") {
+        mainFuncPending = true;
+        await mainFuncHold;
+        mainFuncPending = false;
+        return [{ result: false }];
+      }
+      if (injection.world === "MAIN" && injection.files?.[0] === "procedural.js") {
+        if (mainFuncPending) mainFileStartedWhileFuncPending = true;
+        holdMainFunc();
+      }
+      return [{}];
+    }
+  });
+  await coldMain.onMessage({ type: "InitContentScript" }, topFrameSender(pageUrl));
+  check("MAIN procedural filter dispatches func and procedural.js in parallel (2 calls)",
+    mainFileStartedWhileFuncPending && coldMain.executed.length === 2);
 }
 
 // Scenario J: disabled/paused cache misses remain uncached, and the first

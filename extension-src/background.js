@@ -197,8 +197,10 @@
           ? queued.result
           : [...new Set(ubo.map(([name]) => name))];
         for (const name of names) {
-          const result = await executeInFrame({ target, world: 'MAIN', injectImmediately: true, files: [`scriptlets/${name}.js`] });
-          pending.push(result ? [] : ubo.filter(call => call[0] === name));
+          pending.push(
+            executeInFrame({ target, world: 'MAIN', injectImmediately: true, files: [`scriptlets/${name}.js`] })
+              .then(result => (result ? [] : ubo.filter(call => call[0] === name)))
+          );
         }
       }
     }
@@ -279,6 +281,21 @@
     }
     return { state: "applied" };
   };
+  // Applies procedural filters immediately when the runtime is loaded, or queues
+  // them for procedural.js to drain on load so first-run MAIN injection needs no
+  // round-trip wait before reading/loading the engine.
+  const applyOrQueueProcedural = filters => {
+    if (globalThis.wbeProcedural) {
+      try {
+        globalThis.wbeProcedural.apply(filters);
+      } catch (_) {}
+      return true;
+    }
+    try {
+      globalThis.__wbePendingProcedural = filters;
+    } catch (_) {}
+    return false;
+  };
   const applyConfiguration = (tabId, frameId, configuration, url) => {
     const target = { tabId, frameIds: [frameId] };
     const procedural = configuration.procedural || [];
@@ -286,24 +303,20 @@
     for (const world of ['ISOLATED', 'MAIN']) {
       const filters = procedural.filter(rule => /"type"\s*:\s*"matches-(?:prop|property)"/.test(rule) === (world === 'MAIN'));
       if (!filters.length) continue;
-      pending.push((async () => {
-        const applied = await executeInFrame({ target, world, func: filters => {
-          if (!globalThis.wbeProcedural) return false;
-          try {
-            globalThis.wbeProcedural.apply(filters);
-          } catch (_) {}
-          return true;
-        }, args: [filters] });
-        if (applied?.result) return;
-        const loaded = await executeInFrame({ target, world, files: ['procedural.js'], injectImmediately: true });
-        if (!loaded) return;
-        await executeInFrame({ target, world, func: filters => {
-          try {
-            globalThis.wbeProcedural?.apply(filters);
-          } catch (_) {}
-          return true;
-        }, args: [filters] });
-      })());
+      if (world === 'MAIN') {
+        // MAIN frames usually start without procedural.js; enqueue and load in parallel.
+        pending.push(Promise.all([
+          executeInFrame({ target, world, injectImmediately: true, func: applyOrQueueProcedural, args: [filters] }),
+          executeInFrame({ target, world, files: ['procedural.js'], injectImmediately: true })
+        ]));
+      } else {
+        // ISOLATED matches-css often runs after procedural.js is already present; avoid redundant reloads.
+        pending.push((async () => {
+          const applied = await executeInFrame({ target, world, injectImmediately: true, func: applyOrQueueProcedural, args: [filters] });
+          if (!applied || applied.result) return;
+          await executeInFrame({ target, world, files: ['procedural.js'], injectImmediately: true });
+        })());
+      }
     }
     return Promise.allSettled(pending).then(results => {
       for (const result of results) {
