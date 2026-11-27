@@ -317,6 +317,55 @@ try {
       "native Init error suppresses removeparam cleanup",
       !errorMessages.some(message => message && message.action === "wblock:getCleanURL"),
     );
+
+    const cleanCalls = [];
+    const noQueryBrowser = {
+      runtime: {
+        onMessage: { addListener() {} },
+        sendMessage(message) {
+          cleanCalls.push(message);
+          if (message.type === "InitContentScript") {
+            return Promise.resolve({ type: "InitContentScript", disabled: false, paused: false, payload: { css: [], procedural: [], scriptlets: [] } });
+          }
+          return Promise.resolve({ ok: true, cleanUrl: message.url });
+        },
+      },
+    };
+    const noQueryLoc = { href: "https://youtube.com/watch", hostname: "youtube.com", protocol: "https:" };
+    const noQueryWin = { ...raceWindow, location: noQueryLoc };
+    noQueryWin.top = noQueryWin;
+    await withGlobals({ ...frameGlobals(raceDoc), location: noQueryLoc }, async () => {
+      new Function("browser", "window", "self", source)(noQueryBrowser, noQueryWin, noQueryWin);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    });
+    check(
+      "query-less top-frame URL skips wblock:getCleanURL",
+      !cleanCalls.some(m => m && m.action === "wblock:getCleanURL")
+    );
+
+    const hashCleanCalls = [];
+    const hashQueryLoc = { href: "https://youtube.com/watch#?utm_source=test", hostname: "youtube.com", protocol: "https:" };
+    const hashQueryWin = { ...raceWindow, location: hashQueryLoc };
+    hashQueryWin.top = hashQueryWin;
+    await withGlobals({ ...frameGlobals(raceDoc), location: hashQueryLoc }, async () => {
+      new Function("browser", "window", "self", source)({
+        runtime: {
+          onMessage: { addListener() {} },
+          sendMessage(message) {
+            hashCleanCalls.push(message);
+            if (message.type === "InitContentScript") {
+              return Promise.resolve({ type: "InitContentScript", disabled: false, paused: false, payload: { css: [], procedural: [], scriptlets: [] } });
+            }
+            return Promise.resolve({ ok: true, cleanUrl: message.url });
+          },
+        },
+      }, hashQueryWin, hashQueryWin);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    });
+    check(
+      "fragment-only question mark URL skips wblock:getCleanURL",
+      !hashCleanCalls.some(m => m && m.action === "wblock:getCleanURL")
+    );
   } finally {
     for (const [k, desc] of Object.entries(raceSaved)) {
       if (desc === undefined) delete globalThis[k];

@@ -275,6 +275,9 @@
       if (!/^https?:/i.test(window.location.href)) return;
       if (typeof browser === "undefined" || !browser.runtime || !browser.runtime.sendMessage) return;
       const originalURL = window.location.href;
+      const queryIndex = originalURL.indexOf('?');
+      const hashIndex = originalURL.indexOf('#');
+      if (queryIndex === -1 || (hashIndex !== -1 && queryIndex > hashIndex)) return;
       const response = await browser.runtime.sendMessage({
         action: "wblock:getCleanURL",
         url: originalURL

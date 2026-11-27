@@ -357,31 +357,49 @@
   const PERSISTED_CONFIG_CACHE_LIMIT = 40;
   const PERSIST_CONFIG_CACHE_DELAY_MS = 1000;
   let persistConfigCacheTimer = null;
+  let persistConfigCacheInFlight = false;
+  let persistConfigCachePending = false;
   const persistConfigCache = () => {
+    if (persistConfigCacheInFlight) {
+      persistConfigCachePending = true;
+      return;
+    }
     if (persistConfigCacheTimer !== null) {
       return;
     }
     const generation = configurationGeneration;
     persistConfigCacheTimer = setTimeout(async () => {
       persistConfigCacheTimer = null;
-      if (generation !== configurationGeneration) return;
+      if (generation !== configurationGeneration || persistConfigCacheInFlight) return;
+      persistConfigCacheInFlight = true;
+      persistConfigCachePending = false;
       try {
         const entries = [];
         for (const [key, configuration] of cache) {
           // Top-frame cache keys have no topUrl component.
-          if (key.endsWith("#")) {
+          if (key.endsWith("#") && key !== `${NATIVE_WARMUP_URL}#`) {
             entries.push([key, configuration]);
           }
         }
+        const ts = engineTimestamp;
         await browser.storage.local.set({
           [PERSISTED_CONFIG_CACHE_KEY]: {
             schemaVersion: PERSISTED_CONFIG_CACHE_SCHEMA_VERSION,
-            engineTimestamp,
+            engineTimestamp: ts,
             entries: entries.slice(-PERSISTED_CONFIG_CACHE_LIMIT)
           }
         });
+        if (generation === configurationGeneration && ts !== engineTimestamp) {
+          void browser.storage.local.remove(PERSISTED_CONFIG_CACHE_KEY).catch(() => {});
+        }
       } catch (error) {
         console.warn("[wBlock] Failed to persist config cache:", error);
+      } finally {
+        persistConfigCacheInFlight = false;
+        if (persistConfigCachePending && generation === configurationGeneration) {
+          persistConfigCachePending = false;
+          persistConfigCache();
+        }
       }
     }, PERSIST_CONFIG_CACHE_DELAY_MS);
   };
@@ -390,6 +408,7 @@
       clearTimeout(persistConfigCacheTimer);
       persistConfigCacheTimer = null;
     }
+    persistConfigCachePending = false;
     return browser.storage.local.remove(PERSISTED_CONFIG_CACHE_KEY).catch(error => {
       console.warn("[wBlock] Failed to clear persisted config cache:", error);
     });
@@ -649,13 +668,17 @@
     }
     if (generation !== configurationGeneration) return configuration;
     const fresh = epoch === nativeStateEpoch;
+    let previous = cache.get(key);
     // If the engine timestamp has been updated, clear the cache and update
     // the timestamp.
     if (configuration.engineTimestamp !== engineTimestamp) {
       cache.clear();
+      previous = undefined;
       forgetRecentNativeState();
       void clearWarmScriptlets();
       engineTimestamp = configuration.engineTimestamp;
+      // Drop obsolete persisted rules immediately even if an iframe sees the new timestamp first.
+      void clearPersistedConfigCache();
     }
     if (fresh) configValidatedAt.set(key, Date.now());
     // Save the new message in the cache for the given URL. Delete the key
@@ -668,7 +691,9 @@
       cache.delete(evicted);
       configValidatedAt.delete(evicted);
     }
-    persistConfigCache();
+    if (url !== NATIVE_WARMUP_URL && key.endsWith("#") && !previous) {
+      persistConfigCache();
+    }
     return configuration;
   };
   // Safari lacks onCreatedNavigationTarget. As in uBO, a newly created tab
@@ -1385,6 +1410,14 @@
     }
     if (message && message.action === "wblock:getCleanURL") {
       const url = typeof message.url === "string" ? message.url : "";
+      const queryIndex = url.indexOf("?");
+      const hashIndex = url.indexOf("#");
+      if (queryIndex === -1 || (hashIndex !== -1 && queryIndex > hashIndex)) {
+        return {
+          ok: true,
+          cleanUrl: url
+        };
+      }
       const response = await sendPriorityNativeMessage({ action: "getCleanPageURL", url });
       const cleanUrl = response && typeof response.cleanUrl === "string" ? response.cleanUrl : url;
       return {
@@ -2229,10 +2262,13 @@
   const checkingShutOutTabs = new Set();
   const replacementTabs = new Set();
   const refusedOrigins = new Set();
+  // Top-frame runtime messages prove a content script is alive for the tab's
+  // current origin, letting replaceShutOutTab skip redundant probes until loading.
+  const activeContentScriptOriginByTab = new Map();
   const replaceShutOutTab = async tab => {
     if (!browser.scripting?.executeScript || !/^https?:/i.test(tab.url || "") || checkingShutOutTabs.has(tab.id)) return;
     const origin = new URL(tab.url).origin;
-    if (refusedOrigins.has(origin)) return;
+    if (refusedOrigins.has(origin) || activeContentScriptOriginByTab.get(tab.id) === origin) return;
     checkingShutOutTabs.add(tab.id);
     try {
       const probe = await browser.tabs.sendMessage(tab.id, { type: "wblock:pageSupportProbe" }, { frameId: 0 }).catch(() => null);
@@ -2259,6 +2295,9 @@
         }
         if (changeInfo && (changeInfo.status === "loading" || typeof changeInfo.url === "string")) {
           menuCommandsByTab.delete(tab.id);
+        }
+        if (changeInfo && changeInfo.status === "loading") {
+          activeContentScriptOriginByTab.delete(tab.id);
         }
         if (changeInfo && changeInfo.status && changeInfo.status !== "complete" && !changeInfo.url) {
           return;
@@ -2292,6 +2331,8 @@
         supportStateByTab.delete(tabId);
         actionSyncGenerationByTab.delete(tabId);
         menuCommandsByTab.delete(tabId);
+        activeContentScriptOriginByTab.delete(tabId);
+        replacementTabs.delete(tabId);
       });
     }
   }
@@ -2905,6 +2946,12 @@
   syncNoAutoplayScripts();
   syncGlobalPrivacyControl();
   browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (sender && sender.tab && typeof sender.tab.id === "number" && sender.frameId === 0
+      && typeof sender.url === "string" && /^https?:/i.test(sender.url)) {
+      try {
+        activeContentScriptOriginByTab.set(sender.tab.id, new URL(sender.url).origin);
+      } catch {}
+    }
     scheduleInstallRemoveParamDNRRules(false);
     syncNoAutoplayScripts();
     syncGlobalPrivacyControl();

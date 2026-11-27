@@ -58,6 +58,7 @@ const loadBackground = ({
   dnrUpdateHandler = async () => {},
   removeParamHandler = null,
   tabMessageHandler = async () => ({}),
+  storageSet = null,
 }) => {
   const state = {
     storage,
@@ -106,7 +107,10 @@ const loadBackground = ({
           }
           return { ...state.storage };
         },
-        set: async items => { Object.assign(state.storage, items); },
+        set: async items => {
+          if (storageSet) await storageSet(items);
+          Object.assign(state.storage, items);
+        },
         remove: async key => { delete state.storage[key]; }
       }
     },
@@ -758,6 +762,109 @@ for (const message of [
   await coldMain.onMessage({ type: "InitContentScript" }, topFrameSender(pageUrl));
   check("MAIN procedural filter dispatches func and procedural.js in parallel (2 calls)",
     mainFileStartedWhileFuncPending && coldMain.executed.length === 2);
+}
+
+// Query-less wblock:getCleanURL skips native calls;
+// persistConfigCache avoids redundant disk writes on unchanged or warmup loads.
+for (const source of [canonicalSource, bundleSource]) {
+  const cleanState = loadBackground({
+    source,
+    nativeHandler: message => message.action === "getCleanPageURL"
+      ? { ok: true, cleanUrl: "https://docs.example/?keep=1" }
+      : { payload: makeConfig([], 1) }
+  });
+  await sleep(20);
+  const beforeClean = cleanState.nativeMessages.filter(m => m.action === "getCleanPageURL").length;
+  const noQuery = await cleanState.onMessage({ action: "wblock:getCleanURL", url: "https://docs.example/path" });
+  const hashQuery = await cleanState.onMessage({ action: "wblock:getCleanURL", url: "https://docs.example/path#?utm=1" });
+  check("query-less and fragment-only URLs skip native getCleanPageURL",
+    noQuery.cleanUrl === "https://docs.example/path"
+      && hashQuery.cleanUrl === "https://docs.example/path#?utm=1"
+      && cleanState.nativeMessages.filter(m => m.action === "getCleanPageURL").length === beforeClean);
+
+  // Persist dirty-check: warmup with unchanged engineTimestamp and subframe lookups do not write storage.
+  let diskWrites = 0;
+  const dirtyState = loadBackground({
+    source,
+    storage: {
+      [CACHE_KEY]: {
+        schemaVersion: 2,
+        engineTimestamp: 55,
+        entries: [["https://steady.example/#", makeConfig(["#steady"], 55)]]
+      }
+    },
+    nativeHandler: () => ({ payload: makeConfig(["#steady"], 55) }),
+    storageSet: items => {
+      if (Object.hasOwn(items, CACHE_KEY)) diskWrites += 1;
+    }
+  });
+  await sleep(1150);
+  check("warmup and hydrated cache without changes skip disk persist", diskWrites === 0);
+  await dirtyState.onMessage({ type: "InitContentScript" }, frameSender("https://frame.example/sub", "https://steady.example/"));
+  await sleep(1150);
+  check("subframe lookup skips disk persist", diskWrites === 0);
+  await dirtyState.onMessage({ type: "InitContentScript" }, topFrameSender("https://steady.example/"));
+  await sleep(1150);
+  check("unchanged top-frame revalidation skips disk persist", diskWrites === 0);
+
+  // In-flight storage write race: a newer top-frame config arriving while an
+  // earlier storage.local.set is pending must not lose its dirty flag or overlap writes.
+  let releaseFirstPersist;
+  let stallFirstPersist = true;
+  let inFlightStorageSets = 0;
+  let maxConcurrentStorageSets = 0;
+  const raceState = loadBackground({
+    source,
+    nativeHandler: message => ({ payload: makeConfig([`#${message.payload?.url || "ok"}`], 66) }),
+    storageSet: async items => {
+      if (!Object.hasOwn(items, CACHE_KEY)) return;
+      inFlightStorageSets += 1;
+      if (inFlightStorageSets > maxConcurrentStorageSets) {
+        maxConcurrentStorageSets = inFlightStorageSets;
+      }
+      try {
+        if (stallFirstPersist) {
+          stallFirstPersist = false;
+          await new Promise(resolve => { releaseFirstPersist = resolve; });
+        }
+      } finally {
+        inFlightStorageSets -= 1;
+      }
+    }
+  });
+  await sleep(20);
+  await raceState.onMessage({ type: "InitContentScript" }, topFrameSender("https://first-race.example/"));
+  await sleep(1150);
+  check("first debounced persist enters in-flight storage write", typeof releaseFirstPersist === "function");
+  await raceState.onMessage({ type: "InitContentScript" }, topFrameSender("https://second-race.example/"));
+  releaseFirstPersist();
+  await sleep(1200);
+  const raceEntries = raceState.storage[CACHE_KEY]?.entries || [];
+  check("config arriving during in-flight disk persist is serialized and flushed",
+    maxConcurrentStorageSets === 1
+      && raceEntries.some(([k]) => k === "https://first-race.example/#")
+      && raceEntries.some(([k]) => k === "https://second-race.example/#"));
+
+  // Engine update first seen by an iframe clears the obsolete disk snapshot immediately.
+  const iframeUpdateState = loadBackground({
+    source,
+    storage: {
+      [CACHE_KEY]: {
+        schemaVersion: 2,
+        engineTimestamp: 111,
+        entries: [["https://obsolete.example/#", makeConfig(["#old-rule"], 111)]]
+      }
+    },
+    nativeHandler: message => ({ payload: makeConfig([], message.payload?.url?.includes("sub") ? 222 : 111) })
+  });
+  await sleep(20);
+  await iframeUpdateState.onMessage(
+    { type: "InitContentScript" },
+    frameSender("https://sub.example/frame", "https://obsolete.example/")
+  );
+  await sleep(20);
+  check("iframe seeing newer engineTimestamp clears persisted disk cache immediately",
+    !Object.hasOwn(iframeUpdateState.storage, CACHE_KEY));
 }
 
 // Scenario J: disabled/paused cache misses remain uncached, and the first

@@ -14,16 +14,18 @@ const settle = async () => {
 const load = (file, { probe = null, allowed = true, refused = true } = {}) => {
   const created = [];
   const removed = [];
+  const sentMessages = [];
+  let messageListener = null;
   const browser = {
     runtime: {
-      onMessage: event(), onInstalled: event(), onStartup: event(),
+      onMessage: { addListener(fn) { messageListener = fn; } }, onInstalled: event(), onStartup: event(),
       sendNativeMessage: async () => ({ ok: true, rules: [], userScripts: [] })
     },
     storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
     tabs: {
       query: async () => [],
       get: async id => ({ id, url: 'https://example.com/' }),
-      sendMessage: async () => { if (!probe) throw new Error('Could not establish connection'); return probe; },
+      sendMessage: async (_tabId, msg) => { sentMessages.push(msg); if (!probe) throw new Error('Could not establish connection'); return probe; },
       create: async props => { created.push(props); return { id: 100 + created.length, ...props }; },
       remove: async id => { removed.push(id); },
       onUpdated: event(), onActivated: event(), onCreated: event(), onRemoved: event()
@@ -46,7 +48,14 @@ const load = (file, { probe = null, allowed = true, refused = true } = {}) => {
     for (const listener of browser.tabs.onUpdated.listeners) listener(tab.id, { status: 'complete' }, tab);
     await settle();
   };
-  return { created, removed, complete };
+  const loading = tab => {
+    for (const listener of browser.tabs.onUpdated.listeners) listener(tab.id, { status: 'loading' }, tab);
+  };
+  const notifyTopFrame = async (tab, msg = { action: 'wblock:noop' }) => {
+    if (messageListener) messageListener(msg, { tab, frameId: 0, url: tab.url }, () => {});
+    await settle();
+  };
+  return { created, removed, sentMessages, complete, loading, notifyTopFrame };
 };
 
 const tab = { id: 7, index: 2, active: true, windowId: 1, url: 'https://example.com/page' };
@@ -88,6 +97,20 @@ for (const file of ['extension-src/background.js', 'wBlock Scripts (iOS)/Resourc
     await settle();
     await page.complete({ ...tab, incognito: true, windowId: 9 });
     assert.deepEqual(page.created, [{ url: tab.url, index: 3, active: true, windowId: 9 }], `${file}: a shut-out private tab reopens in its own private window`);
+  }
+  {
+    const page = load(file);
+    await settle();
+    await page.notifyTopFrame(tab);
+    await page.complete(tab);
+    assert.equal(page.sentMessages.filter(m => m?.type === 'wblock:pageSupportProbe').length, 0,
+      `${file}: active top-frame content script skips redundant pageSupportProbe`);
+    assert.equal(page.created.length, 0, `${file}: tab with top-frame message is not replaced`);
+    page.loading(tab);
+    await page.complete(tab);
+    assert.equal(page.sentMessages.filter(m => m?.type === 'wblock:pageSupportProbe').length, 1,
+      `${file}: status: loading clears top-frame activity so a shut-out reload still probes`);
+    assert.equal(page.created.length, 1, `${file}: shut-out reload after loading replaces the tab`);
   }
 }
 
