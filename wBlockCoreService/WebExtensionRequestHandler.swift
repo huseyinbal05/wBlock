@@ -278,6 +278,9 @@ public enum WebExtensionRequestHandler {
             case "getBlockingState":
                 handleGetBlockingState(message: message!, context: context)
                 return
+            case "getPopupState":
+                handleGetPopupState(message: message!, context: context)
+                return
             case "getSiteDisabledState":
                 handleGetSiteDisabledState(message: message!, context: context)
                 return
@@ -751,8 +754,10 @@ public enum WebExtensionRequestHandler {
         }
     }
 
-    private static func handleGetBlockingPausedState(context: NSExtensionContext) {
-        let components = BlockingPauseStore.pausedComponents()
+    private static func blockingPausedStatePayload(
+        components: BlockingPauseComponents? = nil
+    ) -> [String: Any?] {
+        let components = components ?? BlockingPauseStore.pausedComponents(groupIdentifier: pauseGroupIdentifier)
         #if os(macOS)
         let resumeAvailable = NSRunningApplication.runningApplications(
             withBundleIdentifier: "skula.wBlock"
@@ -760,16 +765,20 @@ public enum WebExtensionRequestHandler {
         #else
         let resumeAvailable = false
         #endif
-        let response = createResponse(with: [
+        return [
             "paused": !components.isEmpty,
             "filtersPaused": components.contains(.filters),
             "userScriptsPaused": components.contains(.userScripts),
             "elementZapperPaused": components.contains(.elementZapper),
             // A resume keeps every component paused until its reload commits, which
             // can take a minute; the popup says Resuming instead of Paused then.
-            "resuming": !components.isEmpty && BlockingPauseStore.resumeStatus().status == .applying,
+            "resuming": !components.isEmpty && BlockingPauseStore.resumeStatus(groupIdentifier: pauseGroupIdentifier).status == .applying,
             "resumeAvailable": resumeAvailable
-        ])
+        ]
+    }
+
+    private static func handleGetBlockingPausedState(context: NSExtensionContext) {
+        let response = createResponse(with: blockingPausedStatePayload())
         context.completeRequest(returningItems: [response])
     }
 
@@ -858,6 +867,58 @@ public enum WebExtensionRequestHandler {
                 "zapper": zapper
             ])
             context.completeRequest(returningItems: [response])
+        }
+    }
+
+    private static func handleGetPopupState(message: [String: Any?], context: NSExtensionContext) {
+        let host = (message["host"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let urlString = (message["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let includeFilterUpdateStatus = message["includeFilterUpdateStatus"] as? Bool == true
+        Task { @MainActor in
+            let manager = ProtobufDataManager.shared
+            await manager.waitUntilLoaded()
+            _ = await manager.refreshFromDiskIfModified()
+
+            let pausedComponents = BlockingPauseStore.pausedComponents(groupIdentifier: pauseGroupIdentifier)
+            let pauseState = blockingPausedStatePayload(components: pausedComponents)
+            let master = manager.disabledSites
+            let filterOnly = DisabledSitesNormalizer.effectiveFilterDisabledDomains(
+                master: master,
+                filterOnly: manager.filterDisabledSites
+            )
+            let siteState: [String: Any?] = [
+                "disabled": !host.isEmpty && HostMatcher.isHostDisabled(host: host, disabledSites: filterOnly),
+                "whitelisted": !host.isEmpty && HostMatcher.isHostDisabled(host: host, disabledSites: master),
+                "allDisabled": !host.isEmpty && manager.areAllSiteComponentsDisabled(onHost: host)
+            ]
+            let zapperPaused = pausedComponents.contains(.elementZapper)
+            let zapperState: [String: Any?] = host.isEmpty
+                ? [
+                    "ok": true,
+                    "rules": [String](),
+                    "inheritedRules": [String](),
+                    "disabled": false,
+                    "paused": zapperPaused
+                ]
+                : zapperRulesSnapshot(hostname: host, manager: manager, isPaused: zapperPaused)
+            let noAutoplayState = noAutoplayStatePayload(host: host, manager: manager)
+            let userScriptsPaused = pausedComponents.contains(.userScripts)
+            let pageUserScripts = urlString.isEmpty
+                ? ["userScripts": [[String: Any]](), "siteDisabled": false]
+                : await pageUserScriptsPayload(urlString: urlString, isPaused: userScriptsPaused)
+
+            var payload: [String: Any?] = [
+                "ok": true,
+                "pauseState": pauseState,
+                "siteState": siteState,
+                "zapperState": zapperState,
+                "noAutoplayState": noAutoplayState,
+                "pageUserScripts": pageUserScripts
+            ]
+            if includeFilterUpdateStatus {
+                payload["filterUpdateStatus"] = filterUpdateStatusPayload()
+            }
+            context.completeRequest(returningItems: [createResponse(with: payload)])
         }
     }
 
@@ -1096,7 +1157,7 @@ public enum WebExtensionRequestHandler {
         }
     }
 
-    private static func handleGetFilterUpdateStatus(context: NSExtensionContext) {
+    private static func filterUpdateStatusPayload() -> [String: Any?] {
         let status = FilterUpdatePopupStatus.consumeSnapshot()
         var payload: [String: Any?] = [
             "ok": true,
@@ -1110,7 +1171,11 @@ public enum WebExtensionRequestHandler {
         if status.state == .failed, status.error == nil {
             payload["error"] = "The background update did not complete."
         }
-        let response = createResponse(with: payload)
+        return payload
+    }
+
+    private static func handleGetFilterUpdateStatus(context: NSExtensionContext) {
+        let response = createResponse(with: filterUpdateStatusPayload())
         context.completeRequest(returningItems: [response])
     }
 
@@ -1521,14 +1586,39 @@ public enum WebExtensionRequestHandler {
     private static let totalInlineResponseBudget = 16 * 1024 * 1024
 
 
-    private static func handleGetPageUserScriptsRequest(message: [String: Any?], context: NSExtensionContext) {
-        // Mirrors the pause check above so the page‑level userscript listing also reports none.
-        if BlockingPauseStore.isPaused(.userScripts) {
-            let response = createResponse(with: ["userScripts": []])
-            context.completeRequest(returningItems: [response])
-            return
+    @MainActor
+    private static func pageUserScriptsPayload(urlString: String, isPaused: Bool? = nil) async -> [String: Any?] {
+        // Mirrors the pause check above so the page-level userscript listing also reports none.
+        if isPaused ?? BlockingPauseStore.isPaused(.userScripts, groupIdentifier: pauseGroupIdentifier) {
+            return ["userScripts": [[String: Any]](), "siteDisabled": false]
+        }
+        // Keep the settings list visible when the site is disabled. Per-script
+        // disabled-host settings are the only site-specific userscript gate.
+        let manager = activeUserScriptManager
+        // The extension process can outlive an app-side userscript update.
+        // Reload shared-container records before listing versions/names.
+        await manager.refreshFromDiskForExecution()
+        let pageScripts = manager.pageUserScripts(for: urlString)
+        let descriptors = pageScripts.map { item -> [String: Any] in
+            [
+                "id": item.script.id.uuidString,
+                "kind": item.script.isUserStyle ? "style" : "script",
+                "name": item.script.name,
+                "version": item.script.version,
+                "description": item.script.description,
+                "disabledForSite": item.disabledForSite,
+                "running": !item.disabledForSite
+            ]
         }
 
+        let host = URL(string: urlString)?.host ?? ""
+        return [
+            "userScripts": descriptors,
+            "siteDisabled": manager.areUserScriptsDisabled(onHost: host)
+        ]
+    }
+
+    private static func handleGetPageUserScriptsRequest(message: [String: Any?], context: NSExtensionContext) {
         guard let urlString = message["url"] as? String else {
             let response = createResponse(with: ["userScripts": []])
             context.completeRequest(returningItems: [response])
@@ -1536,30 +1626,8 @@ public enum WebExtensionRequestHandler {
         }
 
         Task { @MainActor in
-            // Keep the settings list visible when the site is disabled. Per-script
-            // disabled-host settings are the only site-specific userscript gate.
-            let manager = activeUserScriptManager
-            // The extension process can outlive an app-side userscript update.
-            // Reload shared-container records before listing versions/names.
-            await manager.refreshFromDiskForExecution()
-            let pageScripts = manager.pageUserScripts(for: urlString)
-            let descriptors = pageScripts.map { item -> [String: Any] in
-                [
-                    "id": item.script.id.uuidString,
-                    "kind": item.script.isUserStyle ? "style" : "script",
-                    "name": item.script.name,
-                    "version": item.script.version,
-                    "description": item.script.description,
-                    "disabledForSite": item.disabledForSite,
-                    "running": !item.disabledForSite
-                ]
-            }
-
-            let host = URL(string: urlString)?.host ?? ""
-            let response = createResponse(with: [
-                "userScripts": descriptors,
-                "siteDisabled": manager.areUserScriptsDisabled(onHost: host)
-            ])
+            let payload = await pageUserScriptsPayload(urlString: urlString)
+            let response = createResponse(with: payload)
             context.completeRequest(returningItems: [response])
         }
     }
@@ -1996,27 +2064,32 @@ public enum WebExtensionRequestHandler {
         }
     }
 
+    @MainActor
+    private static func noAutoplayStatePayload(host: String, manager: ProtobufDataManager) -> [String: Any?] {
+        // With a host, `enabled` becomes the effective per-site answer
+        // (gate armed) and `siteAllowed` its complement, so the gate and
+        // popup need no knowledge of the override lists (#835). Without a
+        // host the global switch is reported as before.
+        let effectiveBlocked = host.isEmpty
+            ? manager.isNoAutoplayEnabled
+            : !manager.isAutoplayAllowed(onHost: host)
+        return [
+            "enabled": effectiveBlocked,
+            "siteAllowed": !host.isEmpty && !effectiveBlocked,
+            "globalEnabled": manager.isNoAutoplayEnabled,
+            // Whether any site blocks autoplay; the extension loads its
+            // No Autoplay scripts only then.
+            "active": manager.isNoAutoplayEnabled || !manager.noAutoplayBlockedSites.isEmpty,
+        ]
+    }
+
     private static func handleGetNoAutoplayState(message: [String: Any?], context: NSExtensionContext) {
         let host = (message["host"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         Task { @MainActor in
-            await ProtobufDataManager.shared.waitUntilLoaded()
-            _ = await ProtobufDataManager.shared.refreshFromDiskIfModified()
-            // With a host, `enabled` becomes the effective per-site answer
-            // (gate armed) and `siteAllowed` its complement, so the gate and
-            // popup need no knowledge of the override lists (#835). Without a
-            // host the global switch is reported as before.
             let manager = ProtobufDataManager.shared
-            let effectiveBlocked = host.isEmpty
-                ? manager.isNoAutoplayEnabled
-                : !manager.isAutoplayAllowed(onHost: host)
-            let response = createResponse(with: [
-                "enabled": effectiveBlocked,
-                "siteAllowed": !host.isEmpty && !effectiveBlocked,
-                "globalEnabled": manager.isNoAutoplayEnabled,
-                // Whether any site blocks autoplay; the extension loads its
-                // No Autoplay scripts only then.
-                "active": manager.isNoAutoplayEnabled || !manager.noAutoplayBlockedSites.isEmpty,
-            ])
+            await manager.waitUntilLoaded()
+            _ = await manager.refreshFromDiskIfModified()
+            let response = createResponse(with: noAutoplayStatePayload(host: host, manager: manager))
             context.completeRequest(returningItems: [response])
         }
     }

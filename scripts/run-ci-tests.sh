@@ -255,6 +255,7 @@ compile_core_test wbe-upgrade scripts/test_wbe_upgrade.swift
 compile_core_test site-component-disable-policy scripts/test_site_component_disable_policy.swift
 compile_core_test user-script-url-support scripts/test_userscript_url_support.swift
 compile_core_test zapper-native-rules scripts/test_zapper_native_rule_generator.swift
+compile_core_test web-extension-batched-state scripts/test_web_extension_batched_state.swift
 
 # These tests exercise internal generated/model state and therefore compile the
 # production files beside the test. SwiftProtobuf is the package product built

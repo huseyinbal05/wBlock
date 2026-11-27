@@ -1346,7 +1346,7 @@
     if (message && message.action === "wblock:popup:nativeMessage") {
       const allowedActions = new Set([
         "logExtensionDiagnostic", "syncZapperRules", "getZapperRules",
-        "getBlockingPausedState", "getResumeRequestStatus", "resumeBlocking", "openApp",
+        "getPopupState", "getBlockingPausedState", "getResumeRequestStatus", "resumeBlocking", "openApp",
         "getSiteDisabledState", "setSiteDisabledState", "setSiteZapperDisabled",
         "getSiteFilterDisabledState", "setSiteFilterDisabledState", "setUserScriptsSiteDisabled", "setAllSiteComponentsDisabled",
         "getPageUserScripts", "setUserScriptSiteDisabledState", "getNoAutoplayState",
@@ -2205,6 +2205,9 @@
     }
     if (updates.length > 0) {
       await Promise.all(updates);
+    }
+    if (actionSyncGenerationByTab.get(tab.id) !== generation) {
+      return;
     }
     const fingerprint = JSON.stringify({
       supported: support.supported,

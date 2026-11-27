@@ -280,6 +280,27 @@ async function syncRulesToNative(host, rules, delta = null) {
     }
 }
 
+async function reconcileNativeZapperResponse(host, response) {
+    const state = normalizeNativeZapperState(response);
+    if (!state) {
+        return null;
+    }
+    const localRules = await loadZapperRules(host);
+    const localSig = rulesSignature(localRules);
+    const nativeSig = rulesSignature(state.rules);
+    const meta = await getSyncMeta(host);
+    if (meta.pendingSync && localSig !== nativeSig) {
+        const reconciled = await syncRulesToNative(host, localRules, pendingDeltaOf(meta));
+        const rules = Array.isArray(reconciled) ? reconciled : localRules;
+        const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, rules);
+        await setSyncMeta(host, { disabled });
+        return { rules, disabled };
+    }
+    const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, state.rules.length === 0 ? localRules : null);
+    await cacheZapperState(host, state.rules, disabled);
+    return { rules: state.rules, disabled };
+}
+
 async function fetchRulesFromNative(host) {
     if (!host) return null;
     try {
@@ -287,57 +308,25 @@ async function fetchRulesFromNative(host) {
             action: 'wblock:zapper:getRules',
             hostname: host,
         }), NATIVE_MESSAGE_TIMEOUT_MS, 'Zapper fetch timed out.');
-        const state = normalizeNativeZapperState(response);
-        if (!state) {
-            return null;
-        }
-        const localRules = await loadZapperRules(host);
-        const localSig = rulesSignature(localRules);
-        const nativeSig = rulesSignature(state.rules);
-        const meta = await getSyncMeta(host);
-        if (meta.pendingSync && localSig !== nativeSig) {
-            const reconciled = await syncRulesToNative(host, localRules, pendingDeltaOf(meta));
-            const rules = Array.isArray(reconciled) ? reconciled : localRules;
-            const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, rules);
-            await setSyncMeta(host, { disabled });
-            return { rules, disabled };
-        }
-        const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, state.rules.length === 0 ? localRules : null);
-        await cacheZapperState(host, state.rules, disabled);
-        return { rules: state.rules, disabled };
+        return await reconcileNativeZapperResponse(host, response);
     } catch {
         try {
             const response = await sendNativeMessage({
                 action: 'getZapperRules',
                 hostname: host,
             });
-            const state = normalizeNativeZapperState(response);
-            if (!state) {
-                return null;
-            }
-            const localRules = await loadZapperRules(host);
-            const localSig = rulesSignature(localRules);
-            const nativeSig = rulesSignature(state.rules);
-            const meta = await getSyncMeta(host);
-            if (meta.pendingSync && localSig !== nativeSig) {
-                const reconciled = await syncRulesToNative(host, localRules, pendingDeltaOf(meta));
-                const rules = Array.isArray(reconciled) ? reconciled : localRules;
-                const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, rules);
-                await setSyncMeta(host, { disabled });
-                return { rules, disabled };
-            }
-            const disabled = state.disabled || await migrateLegacyZapperRulesDisabled(host, state.rules.length === 0 ? localRules : null);
-            await cacheZapperState(host, state.rules, disabled);
-            return { rules: state.rules, disabled };
+            return await reconcileNativeZapperResponse(host, response);
         } catch {
             return null;
         }
     }
 }
 
-async function getAuthoritativeZapperState(host) {
+async function getAuthoritativeZapperState(host, prefetchedResponse = null) {
     if (!host) return { rules: [], disabled: false };
-    const nativeState = await fetchRulesFromNative(host);
+    const nativeState = prefetchedResponse
+        ? await reconcileNativeZapperResponse(host, prefetchedResponse).catch(() => null)
+        : await fetchRulesFromNative(host);
     if (nativeState && Array.isArray(nativeState.rules)) {
         return nativeState;
     }
@@ -971,19 +960,23 @@ function renderZapperRules(rules) {
     }
 }
 
+function validateBlockingPausedState(response) {
+    if (!response || typeof response.paused !== 'boolean' ||
+        typeof response.filtersPaused !== 'boolean' ||
+        typeof response.userScriptsPaused !== 'boolean' ||
+        typeof response.elementZapperPaused !== 'boolean' ||
+        typeof response.resumeAvailable !== 'boolean') {
+        throw new Error('Invalid pause state response');
+    }
+    return response;
+}
+
 async function getBlockingPausedState() {
     try {
         const response = await sendNativeMessage({
             action: 'getBlockingPausedState',
         });
-        if (!response || typeof response.paused !== 'boolean' ||
-            typeof response.filtersPaused !== 'boolean' ||
-            typeof response.userScriptsPaused !== 'boolean' ||
-            typeof response.elementZapperPaused !== 'boolean' ||
-            typeof response.resumeAvailable !== 'boolean') {
-            throw new Error('Invalid pause state response');
-        }
-        return response;
+        return validateBlockingPausedState(response);
     } catch (error) {
         console.error('[wBlock] Failed to get pause state:', error);
         return { error: String((error && error.message) || error) };
@@ -1050,6 +1043,15 @@ async function resumeBlocking() {
 let siteWhitelisted = false;
 let allSiteComponentsDisabled = null;
 
+function normalizeSiteDisabledResponse(response) {
+    const whitelisted = Boolean(response && response.whitelisted);
+    return {
+        disabled: Boolean(response && (response.disabled || whitelisted)),
+        whitelisted,
+        allDisabled: typeof response?.allDisabled === 'boolean' ? response.allDisabled : null,
+    };
+}
+
 // `disabled` and `allDisabled` are null when the state could not be read.
 async function getSiteDisabledState(host) {
     if (!host) return { disabled: false, whitelisted: false, allDisabled: null };
@@ -1058,12 +1060,7 @@ async function getSiteDisabledState(host) {
             action: 'getSiteFilterDisabledState',
             host,
         });
-        const whitelisted = Boolean(response && response.whitelisted);
-        return {
-            disabled: Boolean(response && (response.disabled || whitelisted)),
-            whitelisted,
-            allDisabled: typeof response?.allDisabled === 'boolean' ? response.allDisabled : null,
-        };
+        return normalizeSiteDisabledResponse(response);
     } catch (error) {
         console.error('[wBlock] Failed to get disabled state:', error);
         return { disabled: null, whitelisted: false, allDisabled: null };
@@ -1143,10 +1140,14 @@ async function reloadActiveTab(tabId) {
     }
 }
 
+let cachedIsMacPlatform = null;
 async function isMacPlatform() {
+    if (cachedIsMacPlatform !== null) return cachedIsMacPlatform;
     try {
         const info = await browser.runtime.getPlatformInfo();
-        return typeof info?.os === 'string' && info.os === 'mac';
+        const isMac = typeof info?.os === 'string' && info.os === 'mac';
+        cachedIsMacPlatform = isMac;
+        return isMac;
     } catch (error) {
         console.warn('[wBlock] Failed to get platform info:', error);
         return false;
@@ -1233,6 +1234,21 @@ async function fetchUserscriptCommands(tabId) {
 
 let userScriptsSiteDisabled = false;
 
+function normalizePageUserScriptsResponse(response) {
+    if (!response || !Array.isArray(response.userScripts)) {
+        return { scripts: [], siteDisabled: false };
+    }
+    return {
+        siteDisabled: response.siteDisabled === true,
+        scripts: response.userScripts.filter((script) => (
+            script
+            && typeof script.id === 'string'
+            && typeof script.name === 'string'
+            && script.name.trim().length > 0
+        )),
+    };
+}
+
 async function fetchPageUserScripts(url) {
     const none = { scripts: [], siteDisabled: false };
     if (!url) return none;
@@ -1241,18 +1257,7 @@ async function fetchPageUserScripts(url) {
             action: 'getPageUserScripts',
             url,
         });
-        if (!response || !Array.isArray(response.userScripts)) {
-            return none;
-        }
-        return {
-            siteDisabled: response.siteDisabled === true,
-            scripts: response.userScripts.filter((script) => (
-                script
-                && typeof script.id === 'string'
-                && typeof script.name === 'string'
-                && script.name.trim().length > 0
-            )),
-        };
+        return normalizePageUserScriptsResponse(response);
     } catch (error) {
         console.warn('[wBlock] Failed to fetch page userscripts:', error);
         return none;
@@ -1412,17 +1417,21 @@ async function mirrorNoAutoplayLocalCache(enabled, siteHost, siteAllowed) {
     }
 }
 
+function normalizeNativeNoAutoplayState(response) {
+    if (!isNativeNoAutoplayState(response)) return null;
+    return {
+        enabled: response.enabled,
+        siteAllowed: response.siteAllowed,
+        globalEnabled: response.globalEnabled,
+    };
+}
+
 async function fetchNativeNoAutoplayState(siteHost) {
     try {
         const message = { action: 'getNoAutoplayState' };
         if (siteHost) message.host = siteHost;
         const response = await sendNativeMessage(message);
-        if (!isNativeNoAutoplayState(response)) return null;
-        return {
-            enabled: response.enabled,
-            siteAllowed: response.siteAllowed,
-            globalEnabled: response.globalEnabled,
-        };
+        return normalizeNativeNoAutoplayState(response);
     } catch (error) {
         console.warn('[wBlock] Failed to read native No Autoplay state:', error);
         return null;
@@ -1483,9 +1492,10 @@ async function collectLegacyNoAutoplayAllowHosts(siteHost, localSiteAllowed) {
 
 async function migrateLegacyNoAutoplayToNative(local, siteHost) {
     if (await hasMigratedNoAutoplayToNative()) {
-        return true;
+        return { ok: true, changed: false };
     }
     try {
+        let changed = false;
         const hosts = await collectLegacyNoAutoplayAllowHosts(siteHost, local.siteAllowed);
         for (const host of hosts) {
             const siteResponse = await sendNativeMessage({
@@ -1499,8 +1509,9 @@ async function migrateLegacyNoAutoplayToNative(local, siteHost) {
             if (!siteResponse || siteResponse.ok !== true
                 || typeof siteResponse.enabled !== 'boolean'
                 || typeof siteResponse.siteAllowed !== 'boolean') {
-                return false;
+                return { ok: false, changed: false };
             }
+            changed = true;
         }
         if (local.enabled === true) {
             const enabledResponse = await sendNativeMessage({
@@ -1508,34 +1519,37 @@ async function migrateLegacyNoAutoplayToNative(local, siteHost) {
                 enabled: true,
             });
             if (!enabledResponse || enabledResponse.ok !== true || typeof enabledResponse.enabled !== 'boolean') {
-                return false;
+                return { ok: false, changed: false };
             }
+            changed = true;
         }
         await markNoAutoplayNativeMigrated();
-        return true;
+        return { ok: true, changed };
     } catch (error) {
         console.warn('[wBlock] Failed to migrate No Autoplay state to native:', error);
-        return false;
+        return { ok: false, changed: false };
     }
 }
 
-async function getNoAutoplayState(siteHost) {
+async function getNoAutoplayState(siteHost, prefetchedNative = null) {
     const local = await readNoAutoplayLocalCache(siteHost);
     const localForMigrate = local ?? { enabled: false, siteAllowed: false };
-    let native = await fetchNativeNoAutoplayState(siteHost);
+    let native = normalizeNativeNoAutoplayState(prefetchedNative) || await fetchNativeNoAutoplayState(siteHost);
     if (!native) {
         return local ?? { enabled: false, siteAllowed: false };
     }
 
-    const migrated = await migrateLegacyNoAutoplayToNative(localForMigrate, siteHost);
-    if (!migrated) {
+    const migration = await migrateLegacyNoAutoplayToNative(localForMigrate, siteHost);
+    if (!migration.ok) {
         if (local !== null) {
             return local;
         }
         return native;
     }
 
-    native = await fetchNativeNoAutoplayState(siteHost) || native;
+    if (migration.changed) {
+        native = await fetchNativeNoAutoplayState(siteHost) || native;
+    }
     await mirrorNoAutoplayLocalCache(native.globalEnabled, siteHost, native.siteAllowed);
     return native;
 }
@@ -1965,6 +1979,24 @@ function scheduleResumeRecheck(resuming) {
 // previous page cannot overwrite the page the tab shows now.
 let popupLoadGeneration = 0;
 
+async function fetchPopupState(targetHost, targetUrl, includeFilterUpdateStatus) {
+    try {
+        const response = await sendNativeMessage({
+            action: 'getPopupState',
+            host: targetHost,
+            url: targetUrl,
+            includeFilterUpdateStatus: Boolean(includeFilterUpdateStatus),
+        });
+        if (response && typeof response === 'object' && response.pauseState) {
+            return { batched: true, response };
+        }
+        return { batched: false };
+    } catch (error) {
+        console.error('[wBlock] Failed to get popup state:', error);
+        return { batched: true, error: String((error && error.message) || error) };
+    }
+}
+
 async function refreshUi(options = {}) {
     const generationAtStart = siteToggleGeneration;
     const load = ++popupLoadGeneration;
@@ -1972,24 +2004,12 @@ async function refreshUi(options = {}) {
     if (!siteToggleInFlight && !options.preserveError) {
         setError('');
     }
-    const isMac = await isMacPlatform();
+    const [isMac, activeTab] = await Promise.all([isMacPlatform(), getActiveTabWithRetry()]);
     if (stale()) return;
     const updateFiltersButton = document.getElementById('update-filters');
     if (updateFiltersButton) {
         updateFiltersButton.hidden = false;
         updateFiltersButton.dataset.openInApp = String(!isMac);
-    }
-    if (isMac) {
-        refreshFilterUpdateStatus().catch((error) => {
-            console.warn('[wBlock] Failed to restore filter update status:', error);
-        });
-    }
-    // The resume poll reruns this every 2 s, and the background forces a reinstall
-    // per request, so only a regular load asks for one.
-    if (!options.resumeRecheck) {
-        browser.runtime.sendMessage({ action: 'wblock:installRemoveParamDNRRules' }).catch((error) => {
-            console.warn('[wBlock] Failed to refresh removeparam DNR rules:', error);
-        });
     }
 
     const hostEl = document.getElementById('site-host');
@@ -2005,8 +2025,6 @@ async function refreshUi(options = {}) {
     const pausedPromptMessage = document.getElementById('paused-prompt-message');
     const resumeButton = document.getElementById('resume-blocking');
 
-    const activeTab = await getActiveTabWithRetry();
-    if (stale()) return;
     let pageSupport = getPageSupport(activeTab);
     let supportProbe = null;
     const tabUrlMissing = hasTabId(activeTab) && (
@@ -2019,13 +2037,22 @@ async function refreshUi(options = {}) {
             pageSupport = { supported: true, host: supportProbe.host };
         }
     }
+    const tabChanged = (tab && tab.id) !== (activeTab && activeTab.id);
     tab = activeTab;
-    if (pageSupport.host !== host) lockSiteControls();
+    if (pageSupport.host !== host || tabChanged) {
+        lockSiteControls();
+        renderUserscriptCommands([]);
+    }
     host = pageSupport.host;
 
     if (hostEl) hostEl.textContent = host || '—';
 
     if (!pageSupport.supported) {
+        if (isMac) {
+            refreshFilterUpdateStatus().catch((error) => {
+                console.warn('[wBlock] Failed to restore filter update status:', error);
+            });
+        }
         setStatus(t('popup_status_unsupported', undefined, 'Unsupported'), 'neutral');
         if (disableToggle) disableToggle.disabled = true;
         if (zapperEnabledToggle) zapperEnabledToggle.disabled = true;
@@ -2056,30 +2083,74 @@ async function refreshUi(options = {}) {
         return;
     }
 
-    const blockingPausedPromise = getBlockingPausedState();
-    const pageUserScriptsPromise = fetchPageUserScripts(tab.url);
-    pageUserScriptsPromise.then((page) => {
-        if (stale()) return;
-        userScriptsSiteDisabled = page.siteDisabled;
-        renderPageUserScripts(page.scripts, false);
-    });
-    const disabledPromise = getSiteDisabledState(host);
+    setStatus(t('popup_status_checking', undefined, 'Checking…'), 'neutral');
+
+    const popupStatePromise = fetchPopupState(host, tab.url, isMac);
     const contentScriptReachablePromise = supportProbe
         ? Promise.resolve(supportProbe)
         : probeTabSupport(tab.id);
-    const zapperStatePromise = getAuthoritativeZapperState(host);
-    const noAutoplayStatePromise = getNoAutoplayState(host);
 
-    setStatus(t('popup_status_checking', undefined, 'Checking…'), 'neutral');
-
-    const [pauseState, siteState, zapperState, contentScriptReachable, noAutoplayState] = await Promise.all([
-        blockingPausedPromise,
-        disabledPromise,
-        zapperStatePromise,
-        contentScriptReachablePromise,
-        noAutoplayStatePromise,
-    ]);
+    const popupResult = await popupStatePromise;
+    // Filter update status is global rather than per-tab; render it before any
+    // stale() return so a superseded tab refresh never drops a consumed status.
+    if (isMac && popupResult.batched && popupResult.error === undefined) {
+        const statusSnapshot = popupResult.response.filterUpdateStatus;
+        if (statusSnapshot && statusSnapshot.ok === true && typeof statusSnapshot.state === 'string') {
+            renderFilterUpdateStatus(statusSnapshot);
+            if (statusSnapshot.state === 'running') {
+                pollFilterUpdateStatus().catch((error) => {
+                    console.warn('[wBlock] Filter update status unavailable:', error);
+                });
+            }
+        }
+    }
     if (stale()) return;
+
+    let pauseState;
+    let siteState;
+    let zapperState;
+    let noAutoplayState;
+    let page;
+    if (popupResult.batched) {
+        if (popupResult.error !== undefined) {
+            pauseState = { error: popupResult.error };
+            siteState = { disabled: null, whitelisted: false, allDisabled: null };
+            noAutoplayState = await readNoAutoplayLocalCache(host) ?? { enabled: false, siteAllowed: false };
+            if (stale()) return;
+        } else {
+            const batched = popupResult.response;
+            try {
+                pauseState = validateBlockingPausedState(batched.pauseState);
+            } catch (error) {
+                console.error('[wBlock] Failed to get pause state:', error);
+                pauseState = { error: String((error && error.message) || error) };
+            }
+            siteState = (batched.siteState && typeof batched.siteState === 'object')
+                ? normalizeSiteDisabledResponse(batched.siteState)
+                : { disabled: null, whitelisted: false, allDisabled: null };
+            page = normalizePageUserScriptsResponse(batched.pageUserScripts);
+            [zapperState, noAutoplayState] = await Promise.all([
+                getAuthoritativeZapperState(host, batched.zapperState),
+                getNoAutoplayState(host, batched.noAutoplayState),
+            ]);
+            if (stale()) return;
+        }
+    } else {
+        if (isMac) {
+            refreshFilterUpdateStatus().catch((error) => {
+                console.warn('[wBlock] Failed to restore filter update status:', error);
+            });
+        }
+        [pauseState, siteState, zapperState, noAutoplayState, page] = await Promise.all([
+            getBlockingPausedState(),
+            getSiteDisabledState(host),
+            getAuthoritativeZapperState(host),
+            getNoAutoplayState(host),
+            fetchPageUserScripts(tab.url),
+        ]);
+        if (stale()) return;
+    }
+
     const disabled = siteState.disabled;
     siteWhitelisted = siteState.whitelisted;
     allSiteComponentsDisabled = siteState.allDisabled;
@@ -2093,6 +2164,7 @@ async function refreshUi(options = {}) {
         if (resumeButton) resumeButton.disabled = true;
         if (pausedPrompt) pausedPrompt.hidden = true;
         if (resumeButton) resumeButton.hidden = true;
+        renderUserscriptCommands([]);
         updateNoAutoplayControls(noAutoplayState, { host, locked: true });
         return;
     }
@@ -2177,21 +2249,20 @@ async function refreshUi(options = {}) {
     if (rulesToggle) {
         rulesToggle.disabled = zapperPaused;
     }
-    const [page, commands] = await Promise.all([
-        pageUserScriptsPromise,
-        contentScriptReachable ? fetchUserscriptCommands(tab.id) : [],
-    ]);
-    if (stale()) return;
     userScriptsSiteDisabled = page.siteDisabled;
     renderPageUserScripts(page.scripts, siteWhitelisted || userScriptsPaused || siteToggleInFlight);
     currentZapperRules = zapperState.rules;
     renderZapperCount(host, currentZapperRules.length);
     const zapperClear = document.getElementById('zapper-clear');
     if (zapperClear) zapperClear.disabled = zapperPaused || currentZapperRules.length === 0;
-    renderUserscriptCommands(commands);
     if (zapperRulesExpanded) {
         renderZapperRules(currentZapperRules);
     }
+    const contentScriptReachable = await contentScriptReachablePromise;
+    if (stale()) return;
+    const commands = contentScriptReachable ? await fetchUserscriptCommands(tab.id) : [];
+    if (stale()) return;
+    renderUserscriptCommands(commands);
 }
 
 function loadPopup() {

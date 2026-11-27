@@ -120,7 +120,7 @@ function makeElement(tagName = "div", id = "") {
     focus() {},
   };
   Object.defineProperty(element, "innerHTML", {
-    set() { element.children = []; },
+    set() { element.innerHTMLSets = (element.innerHTMLSets || 0) + 1; element.children = []; },
     get() { return ""; },
   });
   return element;
@@ -219,6 +219,24 @@ const sandbox = {
       },
       testNativeHandler: async (message) => {
         nativeMessages.push(message);
+        if (message?.action === "getPopupState") {
+          const siteState = siteStateHook
+            ? await siteStateHook(message)
+            : { disabled: filterDisabled, whitelisted, allDisabled: whitelisted || componentsDisabled };
+          const siteAllowed = noAutoplaySiteAllowedOverride ?? componentsDisabled;
+          const payload = {
+            ok: true,
+            pauseState: { paused, filtersPaused: paused, userScriptsPaused: paused, elementZapperPaused: paused, resumeAvailable: false },
+            siteState,
+            zapperState: { ok: true, rules: zapperRules.slice(), disabled: componentsDisabled },
+            noAutoplayState: { enabled: !siteAllowed, siteAllowed, globalEnabled: noAutoplayGlobalEnabled },
+            pageUserScripts: { siteDisabled: componentsDisabled, userScripts: siteScripts.map((script) => ({ ...script })) },
+          };
+          if (message.includeFilterUpdateStatus) {
+            payload.filterUpdateStatus = { ok: true, state: "idle" };
+          }
+          return payload;
+        }
         if (message?.action === "getBlockingPausedState") {
           return { paused, filtersPaused: paused, userScriptsPaused: paused, elementZapperPaused: paused, resumeAvailable: false };
         }
@@ -331,7 +349,14 @@ await sandbox.__popupInitPromise;
 
 const rows = elements.get("userscripts-list").children;
 const inputs = rows.map((row) => row.children[1].children[0]);
-check("popup initialization requests page userscripts from native", nativeMessages.some((message) => message.action === "getPageUserScripts" && message.url === "https://example.com/page"));
+check("popup initialization requests batched popup state in 1 native message",
+  nativeMessages.length === 1 && nativeMessages[0].action === "getPopupState" && nativeMessages[0].url === "https://example.com/page");
+check("popup initialization does not trigger forced DNR sync",
+  !runtimeMessages.some((m) => m?.action === "wblock:installRemoveParamDNRRules"));
+check("popup initialization does not fetch filter update status separately",
+  !runtimeMessages.some((m) => m?.action === "wblock:filterUpdate:getStatus"));
+check("popup initialization renders userscripts list once",
+  elements.get("userscripts-list").innerHTMLSets === 1);
 check("userscript controls stay visible when the site is disabled", elements.get("userscripts-section").hidden === false && rows.length === 2);
 check("userscript controls are configurable when site blocking is disabled", inputs.every((input) => input.disabled === false));
 check("enabled per-script site state renders as checked", inputs[0].checked === true);
@@ -395,7 +420,10 @@ check("setNoAutoplaySiteAllowed keeps global cache false when blocking site auto
 
 noAutoplayGlobalEnabled = true;
 noAutoplaySiteAllowedOverride = true;
+const noAutoplayBefore = nativeMessages.filter((m) => m.action === "getNoAutoplayState").length;
 await vm.runInContext("getNoAutoplayState('example.com')", sandbox);
+check("already-migrated getNoAutoplayState sends exactly 1 native message",
+  nativeMessages.filter((m) => m.action === "getNoAutoplayState").length === noAutoplayBefore + 1);
 check("getNoAutoplayState keeps global cache true when site overrides it to allowed",
   storage.get("wblock.noAutoplay.enabled.v1") === true && storage.get("wblock.noAutoplayAllow.v1:example.com") === true);
 await vm.runInContext("setNoAutoplaySiteAllowed('example.com', true)", sandbox);
@@ -467,15 +495,15 @@ showTab("https://other.test/a");
 fireUpdated(9, { url: "https://other.test/a" }, "https://other.test/a");
 await settle();
 check("navigating the tab reloads the popup for the new host", elements.get("site-host").textContent === "other.test");
-check("the reload asks native about the new page", nativeMessages.some((m) => m.action === "getPageUserScripts" && m.url === "https://other.test/a"));
+check("the reload asks native about the new page", nativeMessages.some((m) => m.action === "getPopupState" && m.url === "https://other.test/a"));
 
-const loadsBefore = nativeMessages.filter((m) => m.action === "getBlockingPausedState").length;
+const loadsBefore = nativeMessages.filter((m) => m.action === "getPopupState").length;
 fireUpdated(42, { url: "https://elsewhere.test/" }, "https://elsewhere.test/");
 fireActivated(43, 2);
 fireUpdated(9, { title: "Title only" }, "https://other.test/a");
 await settle();
 check("other tabs, other windows, and title changes leave the popup alone",
-  nativeMessages.filter((m) => m.action === "getBlockingPausedState").length === loadsBefore);
+  nativeMessages.filter((m) => m.action === "getPopupState").length === loadsBefore);
 
 showTab("https://switched.test/", 10);
 fireActivated(10, 1);
@@ -511,5 +539,123 @@ sandbox.document.hidden = false;
 for (const listener of documentListeners.get("visibilitychange") || []) listener();
 await settle();
 check("a hidden popup catches up once shown", elements.get("site-host").textContent === "background.test");
+
+// Legacy native host without getPopupState falls back to individual messages.
+const prevRelay = sandbox.browser.runtime.sendMessage;
+sandbox.browser.runtime.sendMessage = async (message) => {
+  if (message?.action === "wblock:popup:nativeMessage" && message.message?.action === "getPopupState") {
+    return { ok: true, response: { ok: true } };
+  }
+  return prevRelay(message);
+};
+const fallbackPausedBefore = nativeMessages.filter((m) => m.action === "getBlockingPausedState").length;
+showTab("https://legacy.test/", 10);
+await sandbox.__refreshPopupForTest();
+check("legacy native host without getPopupState falls back cleanly",
+  elements.get("site-host").textContent === "legacy.test"
+    && nativeMessages.filter((m) => m.action === "getBlockingPausedState").length === fallbackPausedBefore + 1);
+sandbox.browser.runtime.sendMessage = prevRelay;
+
+// Malformed batched.siteState must lock site controls as unavailable instead of defaulting enabled.
+siteStateHook = () => null;
+showTab("https://malformed-site.test/", 10);
+await sandbox.__refreshPopupForTest();
+check("malformed batched siteState locks enable-toggle and reports Unavailable",
+  elements.get("enable-toggle").disabled === true
+    && elements.get("blocking-status").textContent === "Unavailable");
+siteStateHook = null;
+
+// A slow content-script reachability probe must not block primary popup rendering.
+let releaseProbe;
+const prevTabSendMessage = sandbox.browser.tabs.sendMessage;
+const prevRuntimeRelay = sandbox.browser.runtime.sendMessage;
+sandbox.browser.tabs.sendMessage = async (tabId, message, options) => {
+  if (message?.type === "wblock:pageSupportProbe") {
+    await new Promise((resolve) => { releaseProbe = resolve; });
+    return { ok: true, protocol: "https:", host: "probe-async.test" };
+  }
+  return prevTabSendMessage(tabId, message, options);
+};
+sandbox.browser.runtime.sendMessage = async (message) => {
+  if (message?.action === "wblock:menu:getCommands") {
+    return { ok: true, commands: [{ bridgeId: "b1", commandId: "c1", caption: "Run Test Command", frameId: 0 }] };
+  }
+  return prevRuntimeRelay(message);
+};
+componentsDisabled = false;
+filterDisabled = false;
+showTab("https://probe-async.test/", 10);
+const refreshPromise = sandbox.__refreshPopupForTest();
+await new Promise((resolve) => setTimeout(resolve, 20));
+check("primary popup state renders before slow pageSupportProbe finishes",
+  typeof releaseProbe === "function"
+    && elements.get("site-host").textContent === "probe-async.test"
+    && elements.get("blocking-status").textContent === "Active"
+    && elements.get("enable-toggle").checked === true
+    && elements.get("enable-toggle").disabled === false
+    && elements.get("userscripts-list").children.length === siteScripts.length);
+releaseProbe();
+await refreshPromise;
+check("userscript menu commands render after slow pageSupportProbe resolves",
+  elements.get("userscript-commands").hidden === false
+    && elements.get("userscript-commands").children.length === 1);
+
+// Switching to another tab/host while the new probe is slow must immediately clear previous commands.
+releaseProbe = null;
+showTab("https://probe-next.test/", 11);
+const nextRefreshPromise = sandbox.__refreshPopupForTest();
+await new Promise((resolve) => setTimeout(resolve, 20));
+check("switching tabs clears stale userscript menu commands before slow probe settles",
+  typeof releaseProbe === "function"
+    && elements.get("site-host").textContent === "probe-next.test"
+    && elements.get("userscript-commands").hidden === true
+    && elements.get("userscript-commands").children.length === 0);
+releaseProbe();
+await nextRefreshPromise;
+
+sandbox.browser.tabs.sendMessage = prevTabSendMessage;
+sandbox.browser.runtime.sendMessage = prevRuntimeRelay;
+
+// A superseded popup refresh still renders global filterUpdateStatus without extra status IPC.
+{
+  let releaseFirstStatusPopup;
+  let firstPopupCall = true;
+  const statusCalls = [];
+  const origRelay = sandbox.browser.runtime.sendMessage;
+  sandbox.browser.runtime.sendMessage = async (message) => {
+    if (message?.action === "wblock:popup:nativeMessage" && message.message?.action === "getPopupState") {
+      if (firstPopupCall) {
+        firstPopupCall = false;
+        await new Promise((resolve) => { releaseFirstStatusPopup = resolve; });
+        const res = await origRelay(message);
+        if (res?.response) {
+          res.response.filterUpdateStatus = { ok: true, state: "failed", error: "Update download timed out." };
+        }
+        return res;
+      }
+      return origRelay(message);
+    }
+    if (message?.action === "wblock:filterUpdate:getStatus") {
+      statusCalls.push(message);
+      return { ok: true, state: "idle" };
+    }
+    return origRelay(message);
+  };
+  showTab("https://status-race-1.test/", 12);
+  const firstStatusLoad = sandbox.__refreshPopupForTest();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  showTab("https://status-race-2.test/", 13);
+  const secondStatusLoad = sandbox.__refreshPopupForTest();
+  await secondStatusLoad;
+  releaseFirstStatusPopup();
+  await firstStatusLoad;
+  const statusEl = elements.get("filter-update-status");
+  check("superseded popup refresh still renders global filter-update failure without extra status IPC",
+    statusCalls.length === 0
+      && statusEl.hidden === false
+      && statusEl.classList.contains("is-error")
+      && statusEl.textContent === "Update download timed out.");
+  sandbox.browser.runtime.sendMessage = origRelay;
+}
 
 if (failures > 0) process.exitCode = 1;
